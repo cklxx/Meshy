@@ -120,10 +120,31 @@ class TrainerParamsConfig:
     # token slices (fp32 ``[rows, entropy_chunk_size, V]`` transient).
     log_entropy: bool = True
     entropy_chunk_size: int = 512
+    # ── critic advantages (PPO with an independent value net) ────────────
+    # With ``enable_gae`` the trainer builds per-token advantages itself from
+    # the ``values`` column a critic Service published and the ``reward``
+    # column the rollout shaped, instead of reading a ready-made per-sequence
+    # ``advantage``. The recursion is the same one the critic used to run
+    # (``meshy.backend.titan.critic.gae``); moving it here is what lets the
+    # advantage stay per-token all the way into the PPO ratio.
+    enable_gae: bool = False
+    gae_gamma: float = 1.0
+    # VAPO length-adaptive lambda: lambda_i = 1 - 1/(alpha * L_i). Ignored when
+    # ``gae_lambda`` pins a constant instead.
+    gae_alpha: float = 1.5
+    gae_lambda: float | None = None
 
     def __post_init__(self) -> None:
         if self.entropy_chunk_size <= 0:
             raise ValueError("entropy_chunk_size must be positive")
+        if not 0.0 <= self.gae_gamma <= 1.0:
+            raise ValueError(f"gae_gamma must be within [0, 1], got {self.gae_gamma!r}")
+        if self.gae_alpha <= 0:
+            raise ValueError("gae_alpha must be positive")
+        if self.gae_lambda is not None and not 0.0 <= self.gae_lambda <= 1.0:
+            raise ValueError(
+                f"gae_lambda must be None or within [0, 1], got {self.gae_lambda!r}"
+            )
         if self.old_logprobs_source not in ("rollout", "train"):
             raise ValueError(
                 "old_logprobs_source must be 'rollout' or 'train', "
@@ -204,6 +225,11 @@ class TrainingServiceConfig(ServiceConfig):
     partition_id: str = DEFAULT_DATA_PARTITION
     tq_fields: list[str] = field(default_factory=lambda: list(GRPO_TRAINER_FIELDS))
     tq_poll_interval: float = 0.5
+    #: Number of gen gates a critic Service raises during its cold start, while
+    #: this trainer is idle. The trainer resumes gate numbering above them so
+    #: the rollout's gate stream stays monotonic. Must match
+    #: ``CriticServiceConfig.cold_start_windows``; 0 when there is no critic.
+    critic_cold_start_windows: int = 0
 
 
 @dataclass
@@ -216,9 +242,24 @@ class RolloutServiceConfig(ServiceConfig):
     dataset: str
     dataset_kwargs: dict[str, Any] = field(default_factory=dict)
     reward: str | Callable[[Any], float] | None = None
+    #: Per-sample reward shaping applied to the raw task reward, e.g. the
+    #: recipe's soft-overlong penalty
+    #: (``meshy.reward:soft_overlong_penalty``). When set, ``reward`` on the
+    #: wire is the shaped ``R`` the critic and the GAE recursion consume, and
+    #: the unshaped value is preserved in the ``raw_reward`` column. Unlike
+    #: ``advantage`` this is not skipped by ``external_advantage``: the
+    #: shaping belongs to the reward, not to the advantage estimator.
+    reward_shaping: str | Callable[..., float] | None = None
+    reward_shaping_kwargs: dict[str, Any] = field(default_factory=dict)
     advantage: str | Callable[[list[Any]], Any] | None = None
     advantage_kwargs: dict[str, Any] = field(default_factory=dict)
     filter_zero_std_groups: bool = False
+    #: Cap on how much a run may oversample to replace groups that
+    #: ``filter_zero_std_groups`` dropped, as a multiple of the dataset. 1.0
+    #: disables replacement (a dropped group is simply lost, shortening the
+    #: epoch); 2.0 is the recipe's 2x oversampling budget. Inert when
+    #: ``filter_zero_std_groups`` is False.
+    oversample_factor: float = 1.0
     sampling_params: dict[str, Any] = field(default_factory=dict)
     group_size: int = 1
     num_epochs: int = 1
@@ -229,6 +270,133 @@ class RolloutServiceConfig(ServiceConfig):
     partition_id: str = DEFAULT_DATA_PARTITION
     verbose_trajectory_log: bool = False
     trajectory_log: str | None = None
+    #: Hand the advantage to a critic Service: the rollout stops computing it
+    #: and stops writing the column, so the trainer's AND-filter holds each row
+    #: back until the critic publishes one. Mutually exclusive with
+    #: ``advantage``. See :class:`meshy.config.CriticServiceConfig`.
+    external_advantage: bool = False
+
+    def __post_init__(self) -> None:
+        if self.oversample_factor < 1.0:
+            raise ValueError(
+                f"oversample_factor must be >= 1, got {self.oversample_factor!r}"
+            )
+        if self.reward_shaping is not None and self.reward is None:
+            raise ValueError("reward_shaping needs a reward to shape")
+
+
+# ── PPO critic (VAPO-GAE advantage) ─────────────────────────────────────
+# The critic reads these columns off each rollout row and publishes the
+# ``advantage`` the rollout deliberately left unwritten. As with OPD, TQ's
+# AND-filter is what sequences rollout -> critic -> trainer; no participant
+# needs to know about the others.
+CRITIC_INPUT_FIELDS = ["tokens", "mask_assistant", "reward", "weight_version"]
+#: What the critic writes back onto each rollout row, per ``publish_mode``.
+#: ``"values"`` hands the trainer the per-token value function and lets it run
+#: GAE (``TrainerParamsConfig.enable_gae``); ``"advantage"`` is the original
+#: arrangement where the critic reduces to one scalar per sequence. Either way
+#: it is the column the trainer's AND-filter waits on.
+CRITIC_OUTPUT_FIELDS_BY_MODE = {
+    "values": ["values"],
+    "advantage": ["advantage"],
+}
+CRITIC_OUTPUT_FIELDS = CRITIC_OUTPUT_FIELDS_BY_MODE["advantage"]
+
+#: Trainer columns when the critic publishes ``values`` and the trainer runs
+#: GAE itself. ``advantage`` is gone (nobody writes it) and ``values`` takes
+#: its place as the column that holds a row back until the critic has scored
+#: it. ``reward`` is already in the GRPO list and is now load-bearing rather
+#: than a metric: it carries the shaped ``R`` the GAE recursion consumes.
+GAE_TRAINER_FIELDS = [
+    field for field in GRPO_TRAINER_FIELDS if field != "advantage"
+] + ["values"]
+
+#: Add ``raw_reward`` when the rollout applies reward shaping
+#: (``RolloutServiceConfig.reward_shaping``). It is *not* in the default list
+#: because the trainer's fetch is an AND-filter: asking for a column no
+#: producer writes would hold every row back forever. Shaping makes it
+#: necessary rather than merely informative -- ``reward`` is then ``R``, and a
+#: correct-but-overlong sample can carry ``R < 0.5``, so solve-rate metrics
+#: have to read the unshaped ``r``.
+GAE_TRAINER_FIELDS_SHAPED = GAE_TRAINER_FIELDS + ["raw_reward"]
+
+
+@dataclass
+class CriticServiceConfig(ServiceConfig):
+    """An independent PPO critic replica that owns the advantage signal.
+
+    A separate SPMD (FSDP) replica holding its own value net -- backbone from
+    the base model, scalar value head initialised randomly -- sharing no
+    parameter with the actor. Its only coupling to the actor is the
+    ``advantage`` column it writes back to each rollout row.
+
+    See ``justrl_ii_recipe.md`` §2 for the cold-start discipline the defaults
+    encode, and ``docs/critic_engine.md`` for the value net itself.
+    """
+
+    role: ClassVar[str] = "critic"
+    service_cls: ClassVar[str] = "meshy.service.critic:CriticService"
+    endpoint_port_base: ClassVar[int] = 33000
+    dist_port_base: ClassVar[int] = 43000
+
+    #: base model the backbone is loaded from; the value head stays random
+    model_path: str
+    #: reuses the trainer config for seq_len / dtype / parallel degrees
+    trainer_config: TrainerConfig
+    #: rows per critic window
+    score_batch_size: int
+    #: What the critic writes back per row. ``"values"`` publishes the
+    #: per-token value function and leaves GAE to the trainer (which must set
+    #: ``TrainerParamsConfig.enable_gae`` and fetch ``GAE_TRAINER_FIELDS``);
+    #: ``"advantage"`` keeps the reduction inside the critic. See
+    #: ``CRITIC_OUTPUT_FIELDS_BY_MODE``.
+    publish_mode: Literal["values", "advantage"] = "values"
+    #: Rows resident on the GPU per critic forward. This bounds memory only --
+    #: the value step still accumulates over the whole window and takes one
+    #: optimiser step (recipe §2 counts critic iterations in rollout steps).
+    #: At 128k a single row already fills the card; raise it for short-context
+    #: runs, where one row per forward wastes most of the batch dimension.
+    micro_rows: int = 1
+    #: Train the whole backbone, not just the value head. A value-head-only
+    #: critic is a linear probe on frozen features and measurably plateaus
+    #: before it beats the whitening baseline (var_reduction stays < 0).
+    train_backbone: bool = True
+    lr: float = 5e-6
+    #: critic lr warmup, recipe §2
+    warmup_steps: int = 10
+    #: Windows the critic consumes on its own before publishing any advantage,
+    #: keeping the actor frozen while the cold-start value-loss spike is
+    #: absorbed (recipe §2). The critic paces the rollout itself during these.
+    #: -1 keeps the critic in cold start indefinitely, clearing every window.
+    cold_start_windows: int = 30
+    #: Publish the initial generation gate in runs without an actor trainer.
+    publish_gate_zero: bool = False
+    #: passes over each window's value targets
+    value_epochs: int = 1
+    #: return discount; 1.0 for outcome-reward-only tasks
+    gamma: float = 1.0
+    #: VAPO length-adaptive lambda, lambda_i = 1 - 1/(alpha * L_i). Recipe §1:
+    #: the paper's 0.05 collapses at 128k -- alpha must match response length.
+    alpha: float = 1.5
+    #: value-loss gradient clipping
+    max_norm: float = 1.0
+    timer_enabled: bool = True
+    tq_endpoints_file: str | None = None
+    partition_id: str = DEFAULT_DATA_PARTITION
+    tq_poll_interval: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.publish_mode not in CRITIC_OUTPUT_FIELDS_BY_MODE:
+            raise ValueError(
+                f"publish_mode must be one of "
+                f"{sorted(CRITIC_OUTPUT_FIELDS_BY_MODE)}, got {self.publish_mode!r}"
+            )
+        if self.micro_rows <= 0:
+            raise ValueError("micro_rows must be positive")
+
+    @property
+    def output_fields(self) -> list[str]:
+        return list(CRITIC_OUTPUT_FIELDS_BY_MODE[self.publish_mode])
 
 
 # ── Student Top-K on-policy distillation (OPD) ──────────────────────────
@@ -300,7 +468,13 @@ class OPDTrainingConfig(TrainingServiceConfig):
 
 
 __all__ = [
+    "CRITIC_INPUT_FIELDS",
+    "CRITIC_OUTPUT_FIELDS",
+    "CRITIC_OUTPUT_FIELDS_BY_MODE",
+    "CriticServiceConfig",
     "DEFAULT_DATA_PARTITION",
+    "GAE_TRAINER_FIELDS",
+    "GAE_TRAINER_FIELDS_SHAPED",
     "GRPO_TRAINER_FIELDS",
     "InferenceServiceConfig",
     "OPDTeacherConfig",

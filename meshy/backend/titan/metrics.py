@@ -177,6 +177,15 @@ class TitanTrainer(_BackendTitanTrainer):
         update (its step counter); staleness is measured against it.
         """
         rewards = _values(samples, "reward")
+        # With reward shaping the wire ``reward`` is the *shaped* R, so a
+        # correct-but-overlong sample can sit below the 0.5 solve threshold.
+        # Solve-rate style metrics therefore read the unshaped reward when the
+        # rollout published one, and fall back to ``reward`` when it did not.
+        raw_rewards = _values(samples, "raw_reward") or rewards
+        shaped = bool(_values(samples, "raw_reward"))
+        # Absent when a critic Service owns the advantage: it publishes
+        # ``values`` and the trainer builds per-token advantages itself, which
+        # are reported under ``critic/*`` by ``_attach_gae_advantages``.
         advantages = _values(samples, "advantage")
         weight_versions = _values(samples, "weight_version")
         lengths: list[float] = []
@@ -245,17 +254,30 @@ class TitanTrainer(_BackendTitanTrainer):
                 "rollout/advantages_abs_mean": _mean([abs(v) for v in advantages]),
             })
         if rewards:
-            solved = [v > 0.5 for v in rewards]
+            solved = [v > 0.5 for v in raw_rewards]
             m.update({
                 "grpo_metrics/solve_all": float(all(solved)),
                 "grpo_metrics/solve_none": float(not any(solved)),
-                "rollout/raw_reward_mean": _mean(rewards),
-                "rollout/raw_reward": _mean(rewards),
+                "rollout/raw_reward_mean": _mean(raw_rewards),
+                "rollout/raw_reward": _mean(raw_rewards),
                 "rollout/rewards": _mean(rewards),
                 "rollout/reward_max": max(rewards),
                 "rollout/reward_min": min(rewards),
                 "rollout/pass_rate": _mean([1.0 if s else 0.0 for s in solved]),
             })
+            if shaped:
+                # How much the shaping moved the reward, and on how many
+                # samples. The overlong penalty only fires past its buffer, so
+                # a rising ``penalised_ratio`` is the signal that responses are
+                # running into the length cap.
+                deltas = [r - raw for r, raw in zip(rewards, raw_rewards)]
+                m.update({
+                    "rollout/shaped_reward_mean": _mean(rewards),
+                    "rollout/reward_shaping_delta_mean": _mean(deltas),
+                    "rollout/reward_penalised_ratio": _mean(
+                        [1.0 if abs(d) > 1e-8 else 0.0 for d in deltas]
+                    ),
+                })
         if logprobs:
             m.update({
                 "rollout/log_probs": _mean(logprobs),
@@ -291,6 +313,8 @@ class TitanTrainer(_BackendTitanTrainer):
         }
         if rewards:
             hist["rollout/rewards"] = rewards
+        if shaped:
+            hist["rollout/raw_rewards"] = raw_rewards
         if advantages:
             hist["rollout/advantages"] = advantages
         if logprobs:

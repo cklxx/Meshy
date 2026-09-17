@@ -54,6 +54,7 @@ class TitanTrainingService(SpmdService):
         partition_id: str | None = None,
         tq_fields: list[str] | None = None,
         tq_poll_interval: float = 0.5,
+        critic_cold_start_windows: int = 0,
         runtime: RuntimeDir,
         role: str = "training",
     ) -> None:
@@ -83,6 +84,7 @@ class TitanTrainingService(SpmdService):
         self.partition_id = partition_id
         self.tq_fields = list(tq_fields or [])
         self.tq_poll_interval = tq_poll_interval
+        self.critic_cold_start_windows = int(critic_cold_start_windows)
 
     @classmethod
     def from_info(
@@ -124,6 +126,7 @@ class TitanTrainingService(SpmdService):
             partition_id=config.partition_id,
             tq_fields=list(config.tq_fields),
             tq_poll_interval=float(config.tq_poll_interval),
+            critic_cold_start_windows=int(getattr(config, "critic_cold_start_windows", 0)),
             runtime=runtime,
         )
 
@@ -173,4 +176,5 @@ class TitanTrainingService(SpmdService):
             fetch_batch_size=fetch_batch_size,
             poll_interval=self.tq_poll_interval,
             colocation=colocation,
+            gate_step_offset=self.critic_cold_start_windows,
         )

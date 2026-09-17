@@ -58,7 +58,10 @@ class Batch:
     positions: torch.Tensor              # [rows, S_local] int32 (RoPE positions)
     mask: torch.Tensor                   # [rows, S_local] float (assistant next-token, shifted)
     doc_ids: torch.Tensor                # [rows, S_local] long  (sample index; n_docs = padding)
-    advantages: torch.Tensor             # [n_docs] float
+    #: ``[n_docs]`` when one scalar per sequence (GRPO, or a critic reducing
+    #: its GAE itself), ``[rows, S_local]`` when the advantage is per token
+    #: (``enable_gae``). ``_ppo_clip_loss`` accepts either.
+    advantages: torch.Tensor
     rollout_logprobs: torch.Tensor | None  # [rows, S_local] float | None
     lengths: torch.Tensor                # [n_docs] int32, tokens per sample entering the forward
     n_docs: int                          # number of real samples
@@ -68,6 +71,13 @@ class Batch:
     def n_slots(self) -> int:
         """Segment-buffer size: one slot per sample plus one for padding."""
         return self.n_docs + 1
+
+
+#: Per-token advantage column, attached to each sample by
+#: ``TitanTrainer._attach_gae_advantages`` before the mini-batch loop. Already
+#: on the next-token grid (see the module docstring), so it is laid out like
+#: ``rollout_logprobs`` but *not* shifted again.
+ADVANTAGE_TOKENS = "advantage_tokens"
 
 
 def _sample_view(td: Any, L: int, need_rollout_lp: bool):
@@ -93,10 +103,16 @@ def build_micro_batch(
 ) -> Batch:
     """Materialise ``micro`` from the rank-local ``samples`` as a :class:`Batch`."""
     n_docs = len(micro.sample_idx)
-    advantages = torch.zeros(n_docs, dtype=torch.float32)
     lengths = torch.tensor(micro.doc_lens, dtype=torch.int32)
-    for j, idx in enumerate(micro.sample_idx):
-        advantages[j] = float(samples[idx].get("advantage", 0.0))
+    # Per-token advantages (``enable_gae``) are laid out alongside the other
+    # per-token tensors below; a per-sequence advantage is just ``[n_docs]``.
+    per_token_adv = n_docs > 0 and ADVANTAGE_TOKENS in samples[micro.sample_idx[0]]
+    if per_token_adv:
+        advantages = None  # filled in with the layout
+    else:
+        advantages = torch.zeros(n_docs, dtype=torch.float32)
+        for j, idx in enumerate(micro.sample_idx):
+            advantages[j] = float(samples[idx].get("advantage", 0.0))
 
     if layout == "padded":
         rows, S = micro.n_rows, micro.seq_len
@@ -105,6 +121,7 @@ def build_micro_batch(
         mask = torch.zeros(rows, S, dtype=torch.float32)
         doc_ids = torch.arange(rows, dtype=torch.long).unsqueeze(1).expand(rows, S).clone()
         rollout_lp = torch.zeros(rows, S, dtype=torch.float32) if need_rollout_lp else None
+        adv_tok = torch.zeros(rows, S, dtype=torch.float32) if per_token_adv else None
         for j, idx in enumerate(micro.sample_idx):
             L = micro.doc_lens[j]
             tokens, m, lp = _sample_view(samples[idx], L, need_rollout_lp)
@@ -113,6 +130,9 @@ def build_micro_batch(
             mask[j, :L] = _shift(m)
             if rollout_lp is not None:
                 rollout_lp[j, :L] = _shift(lp)
+            if adv_tok is not None:
+                # Already next-token aligned by the GAE pass, hence no _shift.
+                adv_tok[j, :L] = samples[idx][ADVANTAGE_TOKENS][:L].to(torch.float32)
         if n_docs == 0:
             # Filler micro: the single row is padding.
             doc_ids.fill_(0)
@@ -129,6 +149,7 @@ def build_micro_batch(
         doc_ids = torch.full((1, T), n_docs, dtype=torch.long)
         positions = torch.zeros(1, T, dtype=torch.int32)
         rollout_lp = torch.zeros(1, T, dtype=torch.float32) if need_rollout_lp else None
+        adv_tok = torch.zeros(1, T, dtype=torch.float32) if per_token_adv else None
         cu = [0]
         off = 0
         for j, idx in enumerate(micro.sample_idx):
@@ -141,6 +162,11 @@ def build_micro_batch(
             positions[0, off:off + L] = torch.arange(L, dtype=torch.int32)
             if rollout_lp is not None:
                 rollout_lp[0, off:off + L] = _shift(lp)
+            if adv_tok is not None:
+                # Already next-token aligned by the GAE pass, hence no _shift.
+                adv_tok[0, off:off + L] = samples[idx][ADVANTAGE_TOKENS][:L].to(
+                    torch.float32
+                )
             off += L
             cu.append(off)
         doc_lens = list(micro.doc_lens)
@@ -157,21 +183,30 @@ def build_micro_batch(
     positions = positions.to(device)
     mask = mask.to(device)
     doc_ids = doc_ids.to(device)
-    advantages = advantages.to(device)
     lengths = lengths.to(device)
     if rollout_lp is not None:
         rollout_lp = rollout_lp.to(device)
+    if adv_tok is not None:
+        adv_tok = adv_tok.to(device)
+    else:
+        advantages = advantages.to(device)
 
     if layout == "padded":
         # One CP shard for all per-token tensors so they receive identical
         # head-tail permutations. Optional tensors go last, unpacked by count.
-        optional = [rollout_lp] if rollout_lp is not None else []
+        optional = [t for t in (rollout_lp, adv_tok) if t is not None]
         sharded = sharder.shard_seq(
             input_ids, labels, positions, mask, doc_ids, *optional
         )
         input_ids, labels, positions, mask, doc_ids = sharded[:5]
+        rest = list(sharded[5:])
         if rollout_lp is not None:
-            rollout_lp = sharded[5]
+            rollout_lp = rest.pop(0)
+        if adv_tok is not None:
+            adv_tok = rest.pop(0)
+
+    if adv_tok is not None:
+        advantages = adv_tok
 
     return Batch(
         input_ids=input_ids,
@@ -200,4 +235,4 @@ def make_varlen_metadata(cu_seqlens: Sequence[int], max_len: int, device: torch.
     return VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=int(max_len), max_k=int(max_len))
 
 
-__all__ = ["Batch", "build_micro_batch", "make_varlen_metadata"]
+__all__ = ["ADVANTAGE_TOKENS", "Batch", "build_micro_batch", "make_varlen_metadata"]

@@ -58,15 +58,19 @@ def _build_rollout_worker(
         train_batch_size=int(kwargs["train_batch_size"]),
         sampling_params=kwargs.get("sampling_params", {}),
         reward=kwargs.get("reward") or "meshy.worker.rollout:grpo_advantage",
+        reward_shaping=kwargs.get("reward_shaping"),
+        reward_shaping_kwargs=kwargs.get("reward_shaping_kwargs", {}),
         advantage=kwargs.get("advantage"),
         advantage_kwargs=kwargs.get("advantage_kwargs", {}),
         filter_zero_std_groups=bool(kwargs.get("filter_zero_std_groups", False)),
+        oversample_factor=float(kwargs.get("oversample_factor", 1.0) or 1.0),
         num_epochs=int(kwargs.get("num_epochs", 1)),
         pacing_window=kwargs.get("pacing_window", 1),
         max_running_requests=int(kwargs.get("async_max_running_request", -1) or -1),
         poll_interval=float(kwargs.get("poll_interval", 2.0)),
         trajectory_log=trajectory_log,
         verbose_trajectory_log=bool(kwargs.get("verbose_trajectory_log", False)),
+        external_advantage=bool(kwargs.get("external_advantage", False)),
         colocation=colocation,
     )
 
@@ -114,10 +118,18 @@ class RolloutService(Service):
         # The trainer's batch size == samples one gen gate releases; the pacer
         # needs it to convert the gate stream into a sample budget.
         trainers = topology.training_services()
-        assert trainers, "rollout requires a training service in the topology"
-        trainer_config = trainers[0].config
-        assert isinstance(trainer_config, TrainingServiceConfig)
-        kwargs["train_batch_size"] = int(trainer_config.batch_size)
+        if trainers:
+            trainer_config = trainers[0].config
+            assert isinstance(trainer_config, TrainingServiceConfig)
+            kwargs["train_batch_size"] = int(trainer_config.batch_size)
+        else:
+            # In a trainerless cold start, the critic is the sole consumer.
+            critics = topology.services_by_role("critic")
+            if not critics:
+                raise ValueError(
+                    "rollout requires a training or a critic service in the topology"
+                )
+            kwargs["train_batch_size"] = int(critics[0].config.score_batch_size)
         return cls(name=info.name, kwargs=kwargs, runtime=runtime)
 
     def ignite(self) -> None:

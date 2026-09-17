@@ -442,6 +442,13 @@ class ColocationManager:
                 timeout,
             )
             return None
+        # Vacate the card before the grant is published: once ``grant_request``
+        # lands, the target's manager may run its acquire callback at any
+        # moment, and two residencies on one card is the failure this ring
+        # exists to prevent. The inference engine also tracks it as state --
+        # ``resume_memory_occupation`` pops from ``offload_tags`` and raises
+        # ``KeyError`` on a resume that was never preceded by a release.
+        self._on_release(selected.handle.request.service_id)
         current_request_id = self._grant.request_id if self._grant else None
         if current_request_id and current_request_id in self._handles:
             transport.close_request(self._handles[current_request_id])

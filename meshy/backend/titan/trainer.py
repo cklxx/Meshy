@@ -95,6 +95,10 @@ class TitanTrainer(ForgeEngine):
     use_tis: bool
     tis_ratio_min: float
     tis_ratio_max: float
+    enable_gae: bool
+    gae_gamma: float
+    gae_alpha: float
+    gae_lambda: float | None
     log_entropy: bool
     entropy_chunk_size: int
     timer_enabled: bool
@@ -122,6 +126,10 @@ class TitanTrainer(ForgeEngine):
         tis_ratio_min: float = 0.5,
         tis_ratio_max: float = 5.0,
         logprob_chunk_size: int = 1024,
+        enable_gae: bool = False,
+        gae_gamma: float = 1.0,
+        gae_alpha: float = 1.5,
+        gae_lambda: float | None = None,
         log_entropy: bool = True,
         entropy_chunk_size: int = 512,
         timer_enabled: bool = True,
@@ -150,6 +158,11 @@ class TitanTrainer(ForgeEngine):
         if logprob_chunk_size <= 0:
             raise ValueError("logprob_chunk_size must be positive")
         self._LOGPROB_CHUNK = int(logprob_chunk_size)
+        # Validated upstream by ``meshy.config.TrainerParamsConfig``.
+        self.enable_gae = bool(enable_gae)
+        self.gae_gamma = float(gae_gamma)
+        self.gae_alpha = float(gae_alpha)
+        self.gae_lambda = None if gae_lambda is None else float(gae_lambda)
         if entropy_chunk_size <= 0:
             raise ValueError("entropy_chunk_size must be positive")
         self.log_entropy = bool(log_entropy)
@@ -237,13 +250,24 @@ class TitanTrainer(ForgeEngine):
             "TitanTrainer initialized: params={:,}, seq_len={}, "
             "dp_degree={}, tp={}, cp={}, layout={}, attn={}, micro={}, "
             "max_tokens_per_micro={}, seq_align={}, mini={}, "
-            "clip=[{:.3f}, {:.3f}], old_logprobs_source={}",
+            "clip=[{:.3f}, {:.3f}], old_logprobs_source={}, advantage={}",
             self.model_param_count, self.seq_len, self.dp_degree,
             self.parallel_dims.tp, self.parallel_dims.cp,
             self.batch_layout, attn_backend, self.micro_batch_size,
             self.max_tokens_per_micro, self.seq_align, self.mini_batch_size,
             1 - self.ppo_clip_eps_low, 1 + self.ppo_clip_eps_high,
             self.old_logprobs_source,
+            (
+                f"gae(gamma={self.gae_gamma}, "
+                + (
+                    f"lambda={self.gae_lambda}"
+                    if self.gae_lambda is not None
+                    else f"vapo_alpha={self.gae_alpha}"
+                )
+                + ")"
+            )
+            if self.enable_gae
+            else "column",
         )
 
         # torch.compile interactions with this trainer's GPU lifecycle
@@ -556,6 +580,108 @@ class TitanTrainer(ForgeEngine):
         return build_plan(lengths, loss_tokens, dp_size, self.planner_config)
 
     # ------------------------------------------------------------------
+    # Critic advantages
+    # ------------------------------------------------------------------
+
+    def _attach_gae_advantages(self, samples: Sequence[Any]) -> dict[str, float]:
+        """Turn each row's ``values`` + ``reward`` into a per-token advantage.
+
+        Runs once per ``train_step`` over this rank's whole sample list, before
+        the mini-batch loop, and writes the result onto each sample under
+        :data:`~meshy.backend.titan.batch.ADVANTAGE_TOKENS` for
+        ``build_micro_batch`` to lay out. Doing it per micro-batch instead would
+        repeat the work for every mini-batch pass over the same row and, at
+        ``micro_batch_size=1``, call the recursion once per sequence.
+
+        The whole computation is on the **next-token grid**: position ``t`` is
+        the state about to emit token ``t+1``. ``mask_assistant`` and the token
+        reward are shifted onto it; ``values`` arrive on it already, because the
+        critic trained them there (see
+        ``meshy.backend.titan.critic.data.make_batch``'s ``shift``). That is
+        also the grid ``new_lp`` lives on, so the advantage and the PPO ratio
+        index the same action.
+
+        Each row is its own episode, so the batch is processed as one
+        ``[rows, S]`` block with one document per row -- ``doc_ids`` is the row
+        index, which is exactly the ``padded`` convention the GAE code expects.
+        Rows are padded to the longest *local* sample here, not to ``seq_len``:
+        this runs on the CPU and a 128k-wide block of mostly padding would cost
+        more than the recursion.
+        """
+        from .batch import ADVANTAGE_TOKENS
+        from .critic.gae import compute_vapo_gae
+
+        if not samples:
+            return {}
+
+        rows = len(samples)
+        widths = [min(int(len(td["tokens"])), self.seq_len) for td in samples]
+        S = max(widths)
+        mask = torch.zeros(rows, S, dtype=torch.float32)
+        values = torch.zeros(rows, S, dtype=torch.float32)
+        rewards = torch.zeros(rows, S, dtype=torch.float32)
+        doc_ids = torch.arange(rows, dtype=torch.long).unsqueeze(1).expand(rows, S)
+        doc_ids = doc_ids.contiguous()
+
+        for j, td in enumerate(samples):
+            L = widths[j]
+            m = td["mask_assistant"][:L].to(torch.float32)
+            v = td["values"][:L].to(torch.float32)
+            if v.shape[0] != L:
+                raise ValueError(
+                    f"row {j}: critic published {tuple(td['values'].shape)} values "
+                    f"for {L} tokens; the critic and the trainer disagree about "
+                    f"the sequence"
+                )
+            # Shift the mask and the reward onto the next-token grid; the
+            # values are already on it. ``_shift`` drops position L-1, which
+            # has no successor to act on.
+            mask[j, : L - 1] = m[1:L]
+            values[j, :L] = v
+            response = (m > 0).nonzero()
+            if response.numel() == 0:
+                continue
+            last = int(response[-1].item())
+            if last == 0:
+                # The response is the row's first token: on the next-token grid
+                # there is no state that produced it, so the row has no loss
+                # tokens either (``_sample_lengths`` agrees) and no advantage.
+                continue
+            rewards[j, last - 1] = float(td["reward"].reshape(-1)[0].item())
+
+        if self.gae_lambda is None:
+            # VAPO: λᵢ = 1 - 1/(α·Lᵢ) with Lᵢ the row's own response length,
+            # which ``compute_vapo_gae`` derives from the mask.
+            alpha, lengths = self.gae_alpha, None
+        else:
+            # A constant λ is the same rule with the lengths chosen to produce
+            # it: 1 - 1/(1·L) == gae_lambda at L = 1/(1 - gae_lambda).
+            alpha = 1.0
+            lengths = torch.full(
+                (rows,), 1.0 / max(1e-9, 1.0 - self.gae_lambda), dtype=torch.float32
+            )
+        adv, lam = compute_vapo_gae(
+            rewards, values, mask, doc_ids, rows,
+            gamma=self.gae_gamma, alpha=alpha, lengths=lengths,
+        )
+
+        for j, td in enumerate(samples):
+            td[ADVANTAGE_TOKENS] = adv[j, : widths[j]].clone()
+
+        counts = mask.sum(dim=1).clamp(min=1)
+        per_seq = (adv * mask).sum(dim=1) / counts
+        n_tokens = float(mask.sum())
+        return {
+            "critic/value_mean": float((values * mask).sum() / max(1.0, n_tokens)),
+            "critic/advantage_mean": float((adv * mask).sum() / max(1.0, n_tokens)),
+            "critic/advantage_abs_mean": float(
+                (adv.abs() * mask).sum() / max(1.0, n_tokens)
+            ),
+            "critic/advantage_seq_mean": float(per_seq.mean()),
+            "critic/lambda_mean": float(lam.mean()),
+        }
+
+    # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
@@ -728,6 +854,14 @@ class TitanTrainer(ForgeEngine):
                 samples = full.local_samples(samples, 0)
                 plan = full.per_rank[0]
 
+        gae_metrics: dict[str, float] = {}
+        if self.enable_gae:
+            # Once per step over this rank's whole slice, before any
+            # mini-batch: every mini-batch pass then reads the same per-token
+            # column out of the sample.
+            with timer.timer("train/gae"):
+                gae_metrics = self._attach_gae_advantages(samples)
+
         all_metrics: list[dict[str, float]] = []
         grad_norms: list[torch.Tensor] = []
         for mini in plan:
@@ -745,6 +879,9 @@ class TitanTrainer(ForgeEngine):
         for key, value in plan_stats(plan, self.batch_layout).items():
             result[f"train/{key}"] = float(value)
         result["num_mini_batches"] = float(len(plan))
+        # Rank-local by construction (this rank's DP slice); the caller only
+        # logs rank 0, same as the rollout statistics.
+        result.update(gae_metrics)
         return result
 
     def _run_mini_batch(

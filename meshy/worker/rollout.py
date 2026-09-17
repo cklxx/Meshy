@@ -23,6 +23,17 @@ from meshy.service.colocation import ColocationManager, RequestKind
 #: (``meshy.config.GRPO_TRAINER_FIELDS``): the fetch is an AND-filter.
 GRPO_FIELDS = tuple(GRPO_TRAINER_FIELDS)
 
+#: The same columns minus ``advantage``, written when a critic Service owns the
+#: advantage instead. Because the trainer's fetch is an AND-filter, leaving the
+#: column unwritten is exactly what holds each row back until the critic fills
+#: it in -- no extra column and no schema change on either side. See
+#: :class:`meshy.worker.critic.CriticWorker`.
+GRPO_FIELDS_NO_ADVANTAGE = tuple(f for f in GRPO_FIELDS if f != "advantage")
+
+#: Added when reward shaping is configured: ``reward`` then carries the shaped
+#: ``R`` and this carries the unshaped task reward (:mod:`meshy.reward`).
+RAW_REWARD_FIELD = "raw_reward"
+
 
 def resolve_callable(value: str | Callable[..., Any]) -> Callable[..., Any]:
     if callable(value):
@@ -51,10 +62,20 @@ def grpo_advantage(samples: list[Any]) -> None:
 
 
 def is_zero_variance_group(samples: list[Any], *, tolerance: float = 1e-8) -> bool:
-    """Return whether all raw rewards in a completed group are equal."""
+    """Return whether all raw rewards in a completed group are equal.
+
+    Deliberately the *raw* reward, not the shaped one: the question dynamic
+    sampling asks is whether the group's outcomes were informative about the
+    task. Length shaping perturbs every sample a little, so keying on the
+    shaped reward would report an all-correct group as having variance and
+    defeat the filter.
+    """
     if not samples:
         return True
-    rewards = [float(sample.reward) for sample in samples]
+    rewards = [
+        float(sample.reward if getattr(sample, "raw_reward", None) is None else sample.raw_reward)
+        for sample in samples
+    ]
     return max(rewards) - min(rewards) <= tolerance
 
 
@@ -62,14 +83,27 @@ def sample_to_tensordict(sample: Any, weight_version: int):
     import torch
     from tensordict import TensorDict
 
+    raw_reward = getattr(sample, "raw_reward", None)
     return TensorDict(
         {
             "tokens": torch.tensor(list(sample.tokens), dtype=torch.long),
             "logprobs": torch.tensor(list(sample.logprobs), dtype=torch.float32),
             "mask_assistant": torch.tensor(list(sample.masks), dtype=torch.float32),
-            "advantage": torch.tensor(float(sample.advantage), dtype=torch.float32),
+            # ``None`` when a critic Service owns the advantage: the column is
+            # excluded from the write (GRPO_FIELDS_NO_ADVANTAGE), so this
+            # placeholder never reaches TQ.
+            "advantage": torch.tensor(
+                0.0 if sample.advantage is None else float(sample.advantage),
+                dtype=torch.float32,
+            ),
             "weight_version": torch.tensor(int(weight_version), dtype=torch.int64),
             "reward": torch.tensor(float(sample.reward), dtype=torch.float32),
+            # Equal to ``reward`` when no shaping is configured; the column is
+            # only written when the worker declares it.
+            RAW_REWARD_FIELD: torch.tensor(
+                float(sample.reward if raw_reward is None else raw_reward),
+                dtype=torch.float32,
+            ),
             "truncated": torch.tensor(int(bool(getattr(sample, "truncated", False))), dtype=torch.int64),
             "repetition": torch.tensor(int(bool(getattr(sample, "repetition", False))), dtype=torch.int64),
             "mixed_version": torch.tensor(
@@ -154,15 +188,19 @@ class RolloutWorker(TQWorker):
         train_batch_size: int,
         sampling_params: dict[str, Any] | None,
         reward: str | Callable[[Any], float],
+        reward_shaping: str | Callable[..., float] | None = None,
+        reward_shaping_kwargs: dict[str, Any] | None = None,
         advantage: str | Callable[[list[Any]], Any] | None = None,
         advantage_kwargs: dict[str, Any] | None = None,
         filter_zero_std_groups: bool = False,
+        oversample_factor: float = 1.0,
         num_epochs: int = 1,
         pacing_window: int | str | None = 1,
         max_running_requests: int = -1,
         poll_interval: float = 2.0,
         trajectory_log: str | None = None,
         verbose_trajectory_log: bool = False,
+        external_advantage: bool = False,
         client_factory=None,
         colocation: ColocationManager | None = None,
     ) -> None:
@@ -185,9 +223,42 @@ class RolloutWorker(TQWorker):
         self.train_batch_size = int(train_batch_size)
         self.sampling_params = dict(sampling_params or engine.sampling_params)
         self.reward_fn = resolve_callable(reward)
-        self.advantage_fn = grpo_advantage if advantage is None else resolve_callable(advantage)
+        # Shaping is part of the reward, so it is applied here rather than in
+        # the advantage pipeline -- which ``external_advantage`` skips
+        # entirely. See :mod:`meshy.reward`.
+        self.reward_shaping_fn = (
+            resolve_callable(reward_shaping) if reward_shaping is not None else None
+        )
+        self.reward_shaping_kwargs = dict(reward_shaping_kwargs or {})
+        # A critic Service computes the advantage from its own value net, so
+        # the rollout must neither compute nor publish the column: writing a
+        # group-normalised placeholder would satisfy the trainer's AND-filter
+        # and let rows through before the critic ever saw them.
+        self.external_advantage = bool(external_advantage)
+        if self.external_advantage:
+            if advantage is not None:
+                raise ValueError(
+                    "external_advantage=True hands the advantage to a critic "
+                    "Service; an inline advantage callable would be ignored"
+                )
+            self.advantage_fn = None
+            fields = GRPO_FIELDS_NO_ADVANTAGE
+        else:
+            self.advantage_fn = grpo_advantage if advantage is None else resolve_callable(advantage)
+            fields = GRPO_FIELDS
+        # Declared only when there is something to distinguish it from
+        # ``reward``: the trainer's fetch is an AND-filter, so a column no
+        # consumer asked for is harmless but one nobody writes is fatal.
+        if self.reward_shaping_fn is not None:
+            fields = fields + (RAW_REWARD_FIELD,)
+        self.rollout_fields = fields
         self.advantage_kwargs = dict(advantage_kwargs or {})
         self.filter_zero_std_groups = bool(filter_zero_std_groups)
+        if oversample_factor < 1.0:
+            raise ValueError("oversample_factor must be >= 1")
+        # Replacement budget for groups dropped by ``filter_zero_std_groups``,
+        # in multiples of the dataset. See :meth:`_run_rollouts`.
+        self.oversample_factor = float(oversample_factor)
         self.groups_seen = 0
         self.groups_filtered = 0
         self.num_epochs = int(num_epochs)
@@ -221,7 +292,7 @@ class RolloutWorker(TQWorker):
             },
             outputs={
                 "rollouts": TQOutput(
-                    fields=GRPO_FIELDS,
+                    fields=self.rollout_fields,
                     new_rows=True,
                     partition=partition_id,
                 )
@@ -321,7 +392,17 @@ class RolloutWorker(TQWorker):
             tokens, logprobs = generation
             builder.append_tokens(sample, "assistant", tokens, logprobs)
             self._stamp_sample(sample, generation)
-            sample.reward = self.reward_fn(sample)
+            reward = float(self.reward_fn(sample))
+            if self.reward_shaping_fn is not None:
+                # ``reward`` becomes the shaped R the critic and the GAE
+                # recursion consume; the unshaped value rides along so the
+                # solve-rate metrics stay about correctness.
+                sample.raw_reward = reward
+                sample.reward = float(
+                    self.reward_shaping_fn(reward, sample, **self.reward_shaping_kwargs)
+                )
+            else:
+                sample.reward = reward
             return sample
 
         group = await asyncio.gather(*(rollout_one(sample) for sample in group))
@@ -336,13 +417,14 @@ class RolloutWorker(TQWorker):
                     rewards[0] if rewards else None,
                 )
                 return None
-        advantages = self.advantage_fn(group, **self.advantage_kwargs)
-        if advantages is not None:
-            values = list(advantages)
-            if len(values) != len(group):
-                raise ValueError("advantage function result length must match rollout group")
-            for sample, value in zip(group, values):
-                sample.advantage = float(value)
+        if self.advantage_fn is not None:
+            advantages = self.advantage_fn(group, **self.advantage_kwargs)
+            if advantages is not None:
+                values = list(advantages)
+                if len(values) != len(group):
+                    raise ValueError("advantage function result length must match rollout group")
+                for sample, value in zip(group, values):
+                    sample.advantage = float(value)
         return group
 
     @staticmethod
@@ -369,10 +451,39 @@ class RolloutWorker(TQWorker):
         from meshy.transferqueue import adapter
 
         rows = [sample_to_tensordict(sample, version) for sample in group]
-        data = adapter.samples_to_td(rows, GRPO_FIELDS)
+        data = adapter.samples_to_td(rows, self.rollout_fields)
         if self.trajectory_logger is not None:
             await self.trajectory_logger.write(group, version)
         await self.write_tq_output("rollouts", data)
+
+    def _oversample_budget(self, dataset_prompts: int | None) -> int | None:
+        """Extra prompts this epoch may spend replacing filtered groups.
+
+        ``filter_zero_std_groups`` drops a group after it has been generated,
+        so without replacement an epoch that filters heavily yields fewer
+        windows than it has prompts for. Replacement here is *implicit* rather
+        than a refill buffer: the rollout does not drain a window before
+        starting the next (``pacing_window=None``), and every consumer takes a
+        fixed row count off TQ, so a dropped group is simply made up by the
+        prompts already in flight behind it. All this budget does is bound how
+        far the epoch may over-run its nominal length -- which is what stops a
+        stretch of uniformly-solved prompts from burning the dataset.
+
+        ``None`` when no bound applies: the filter is off, no replacement was
+        asked for, or the dataset cannot report its own size (in which case
+        there is nothing to take a fraction of, and an unbounded epoch is the
+        pre-existing behaviour rather than a new risk).
+        """
+        if not self.filter_zero_std_groups or self.oversample_factor <= 1.0:
+            return None
+        if not dataset_prompts:
+            logger.warning(
+                "RolloutWorker: oversample_factor={} ignored -- the dataset does "
+                "not expose ``n_prompts``",
+                self.oversample_factor,
+            )
+            return None
+        return int(dataset_prompts * (self.oversample_factor - 1.0))
 
     async def _run_rollouts(self) -> None:
         from meshy.utils.sample import SampleBuilder
@@ -401,11 +512,30 @@ class RolloutWorker(TQWorker):
             if self.stopped:
                 break
             dataset = self.dataset_factory(**self.dataset_kwargs)
+            budget = self._oversample_budget(getattr(dataset, "n_prompts", None))
+            filtered_at_epoch_start = self.groups_filtered
             while not self.stopped:
                 prompts = dataset.next_batch(builder)
                 if not prompts:
-                    logger.info("RolloutWorker dataset exhausted (epoch {})", epoch)
+                    logger.info(
+                        "RolloutWorker dataset exhausted (epoch {}); {} of {} groups "
+                        "filtered as zero-variance",
+                        epoch,
+                        self.groups_filtered,
+                        self.groups_seen,
+                    )
                     break
+                if budget is not None:
+                    spent = self.groups_filtered - filtered_at_epoch_start
+                    if spent > budget:
+                        logger.info(
+                            "RolloutWorker: oversample budget exhausted (epoch {}): "
+                            "{} groups filtered, budget {}",
+                            epoch,
+                            spent,
+                            budget,
+                        )
+                        break
                 for prompt in prompts:
                     version = await self.acquire_generation_slot(self.group_size)
                     if semaphore is not None:
@@ -419,6 +549,8 @@ class RolloutWorker(TQWorker):
 
 __all__ = [
     "GRPO_FIELDS",
+    "GRPO_FIELDS_NO_ADVANTAGE",
+    "RAW_REWARD_FIELD",
     "RolloutWorker",
     "grpo_advantage",
     "is_zero_variance_group",

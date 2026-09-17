@@ -35,12 +35,20 @@ class TitanWorker(TQWorker):
         retry_interval: float = 1.0,
         client_factory=None,
         colocation: ColocationManager | None = None,
+        gate_step_offset: int = 0,
     ) -> None:
         super().__init__()
         if not tq_fields:
             raise ValueError("TitanWorker requires non-empty tq_fields")
         if batch_size <= 0:
             raise ValueError("TitanWorker batch_size must be positive")
+        if gate_step_offset < 0:
+            raise ValueError("TitanWorker gate_step_offset must be >= 0")
+        # A critic cold start paces the rollout itself for its first N windows
+        # (the trainer is idle, so it cannot). Those gates occupy steps
+        # ``1..N``, so the trainer resumes numbering above them and the gate
+        # stream the rollout reads stays monotonic across the hand-off.
+        self.gate_step_offset = int(gate_step_offset)
         self.engine = engine
         self.colocation = colocation
         self._colocation_request = None
@@ -81,15 +89,19 @@ class TitanWorker(TQWorker):
         )
 
     def startup_tq_outputs(self) -> Mapping[str, Any]:
-        return self._gate_output(step=self._current_version())
+        # The genesis gate establishes the version inference may generate
+        # against. It precedes any critic cold-start gate, so it is never
+        # offset -- the rollout must see step 0 first.
+        return self._gate_output(step=self._current_version(), offset=0)
 
     def _current_version(self) -> int:
         return int(getattr(self.engine, "weight_version", getattr(self.engine, "step_index", 0)))
 
-    def _gate_output(self, *, step: int) -> Mapping[str, Any]:
+    def _gate_output(self, *, step: int, offset: int | None = None) -> Mapping[str, Any]:
         from meshy.transferqueue.control import make_gen_gate
 
         version = self._current_version()
+        step = int(step) + (self.gate_step_offset if offset is None else int(offset))
         logger.info("Titan {} raised gen gate {} (v{})", getattr(self.engine, "name", "titan"), step, version)
         return {"gate": make_gen_gate(step=step, weight_version=version)}
 
