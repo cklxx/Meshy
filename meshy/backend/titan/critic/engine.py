@@ -269,7 +269,12 @@ class CriticEngine:
         return min(aligned, self.seq_len)
 
     def make_batch(
-        self, samples: list[Any], *, device: Any = None, shift: bool = True
+        self,
+        samples: list[Any],
+        *,
+        device: Any = None,
+        shift: bool = True,
+        pad_to: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """``data.make_batch`` with the CP-safe padding width applied.
 
@@ -280,15 +285,29 @@ class CriticEngine:
 
         ``shift`` defaults to the pipeline's next-token grid (see
         ``data.make_batch``); pass ``shift=False`` only for inspection.
+
+        ``pad_to`` overrides the derived width for callers that already decided
+        it -- the dynamic-batching planner picks a micro-batch's row length
+        when it packs the micro-batch, and it must be the width actually used
+        or the plan's token accounting and the batch disagree. It still has to
+        sit on the CP lattice, so it is validated rather than trusted.
         """
         from .data import make_batch
 
         device = self.device if device is None else device
-        longest = max((len(s.tokens) for s in samples), default=0)
-        # Round the padded width up to the CP lattice. ``seq_align`` is 1 when
-        # CP (and TP) are off, so this degenerates to the raw helper.
-        pad_to = min(-(-longest // self.seq_align) * self.seq_align, self.seq_len)
-        return make_batch(samples, device=device, pad_to=pad_to, shift=shift)
+        if pad_to is None:
+            longest = max((len(s.tokens) for s in samples), default=0)
+            # Round the padded width up to the CP lattice. ``seq_align`` is 1
+            # when CP (and TP) are off, so this degenerates to the raw helper.
+            pad_to = -(-longest // self.seq_align) * self.seq_align
+        elif pad_to % self.seq_align != 0:
+            raise ValueError(
+                f"pad_to ({pad_to}) must be a multiple of the CP/TP sequence "
+                f"divisor ({self.seq_align})"
+            )
+        return make_batch(
+            samples, device=device, pad_to=min(pad_to, self.seq_len), shift=shift
+        )
 
     @torch.no_grad()
     def hidden_states(
@@ -410,14 +429,17 @@ class CriticEngine:
         denominator is the global mask count across DP and CP, which makes the
         summed gradient equal the gradient of the global mean.
         """
-        return self.train_value_accumulated(
+        loss, _ = self.train_value_accumulated(
             [(input_ids, positions, targets, mask, attention_masks)]
         )
+        return loss
 
     def train_value_accumulated(
         self,
         batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Any]],
-    ) -> float:
+        *,
+        collect_values: bool = False,
+    ) -> tuple[float, list[torch.Tensor]]:
         """Accumulate value gradients over several micro-batches.
 
         ``batches`` are ``(input_ids, positions, targets, mask, attention_masks)``
@@ -426,6 +448,21 @@ class CriticEngine:
         micro-batch and every data/CP rank, so this is mathematically the same
         as fitting one concatenated mini-batch while keeping peak memory at the
         micro-batch size.
+
+        Returns ``(loss, values)``. With ``collect_values`` the second element
+        is one gathered ``[rows, S]`` CPU tensor per micro-batch, in ``batches``
+        order; otherwise it is empty.
+
+        Those values are worth taking: **every forward here runs on the
+        pre-update weights**, because the optimizer steps only once, after the
+        whole list has contributed gradients. So they are exactly what a
+        separate no-grad scoring pass over the same rows would return -- and
+        that pass is a fifth of the critic's compute (one forward against the
+        forward + recompute + backward this does). A caller that needs the
+        pre-update value function for publishing or for the health gauges
+        should take it from here rather than pay for it twice. If the caller
+        loops for several value epochs, only the first call's values carry that
+        guarantee; the later ones see weights this step already moved.
         """
         if not batches:
             raise ValueError("train_value_accumulated requires at least one batch")
@@ -449,6 +486,7 @@ class CriticEngine:
             local_count = local_count + local_mask.float().sum()
         denom = self._global_sum(local_count).clamp(min=1.0)
         local_numerator = torch.zeros((), device=self.device, dtype=torch.float32)
+        collected: list[torch.Tensor] = []
 
         for input_ids, positions, targets, mask, attention_masks in batches:
             # Offline callers may keep the queued micro-batches on CPU so a
@@ -471,6 +509,12 @@ class CriticEngine:
                     raise RuntimeError(f"Non-finite critic loss: {loss.item()}")
                 local_numerator = local_numerator + numerator.detach().float()
                 loss.backward()
+            if collect_values:
+                # Back to temporal order before it leaves the engine: the CP
+                # shard is a head-tail permutation, so a caller slicing row
+                # ``j`` to its own length would otherwise get the wrong tokens.
+                (full,) = self.sharder.gather_seq(values.detach())
+                collected.append(full.float().cpu())
 
         # The cold-start value-loss spike is large (recipe §2 reports a peak
         # around 32); an unclipped step on it moves the head a long way.
@@ -478,7 +522,7 @@ class CriticEngine:
         self.optimizer.step()
 
         global_numerator = self._global_sum(local_numerator)
-        return float((global_numerator / denom).detach())
+        return float((global_numerator / denom).detach()), collected
 
     def _global_sum(self, value: torch.Tensor) -> torch.Tensor:
         """Sum a scalar over the loss mesh (DP + CP), preserving gradients off."""

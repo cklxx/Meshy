@@ -41,6 +41,7 @@ class CriticService(SpmdService):
         score_batch_size: int,
         publish_mode: str,
         micro_rows: int,
+        max_tokens_per_micro: int | None,
         train_backbone: bool,
         lr: float,
         warmup_steps: int,
@@ -67,6 +68,7 @@ class CriticService(SpmdService):
         self.score_batch_size = score_batch_size
         self.publish_mode = publish_mode
         self.micro_rows = micro_rows
+        self.max_tokens_per_micro = max_tokens_per_micro
         self.train_backbone = train_backbone
         self.lr = lr
         self.warmup_steps = warmup_steps
@@ -115,6 +117,11 @@ class CriticService(SpmdService):
             score_batch_size=int(config.score_batch_size),
             publish_mode=str(config.publish_mode),
             micro_rows=int(config.micro_rows),
+            max_tokens_per_micro=(
+                int(config.max_tokens_per_micro)
+                if config.max_tokens_per_micro
+                else None
+            ),
             train_backbone=bool(config.train_backbone),
             lr=float(config.lr),
             warmup_steps=int(config.warmup_steps),
@@ -170,6 +177,7 @@ class CriticService(SpmdService):
             alpha=self.alpha,
             max_norm=self.max_norm,
             micro_rows=self.micro_rows,
+            max_tokens_per_micro=self.max_tokens_per_micro,
             publish_mode=self.publish_mode,
             is_colocate=self.is_colocate,
         )

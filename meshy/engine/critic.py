@@ -46,6 +46,7 @@ class CriticSpmdEngine(SpmdEngine):
         alpha: float = 1.5,
         max_norm: float = 1.0,
         micro_rows: int = 1,
+        max_tokens_per_micro: int | None = None,
         publish_mode: str = "values",
         is_colocate: bool = False,
         bind_host: str = "127.0.0.1",
@@ -71,8 +72,18 @@ class CriticSpmdEngine(SpmdEngine):
         self.gamma = float(gamma)
         self.alpha = float(alpha)
         self.max_norm = float(max_norm)
-        #: rows per critic forward; long sequences need this small
+        #: rows per critic forward, used only when ``max_tokens_per_micro`` is
+        #: unset; long sequences need this small
         self.micro_rows = int(micro_rows)
+        #: Token budget per critic forward. Preferred over :attr:`micro_rows`:
+        #: a window's rows span two orders of magnitude in length (p50 ~10k,
+        #: p90 ~40k at 128k), so a fixed row count either wastes the batch
+        #: dimension on the short rows or blows memory on the long ones. With a
+        #: budget the planner sorts by length and packs to it, which is what
+        #: collapses a 480-row window from 480 forwards into a few dozen.
+        self.max_tokens_per_micro = (
+            int(max_tokens_per_micro) if max_tokens_per_micro else None
+        )
         if publish_mode not in ("values", "advantage"):
             raise ValueError(
                 f"publish_mode must be 'values' or 'advantage', got {publish_mode!r}"
@@ -187,9 +198,33 @@ class CriticSpmdEngine(SpmdEngine):
 
     # ── implementation (all ranks) ──────────────────────────────────────
     def _score_and_train_impl(self, samples: list[Any] | None) -> dict[str, Any] | None:
+        """One window: plan it, fit the value net, ship the result to rank 0.
+
+        The window is *sharded* across the DP mesh and *packed* by token budget
+        inside each shard, both by the same planner the actor trainer uses
+        (``meshy.backend.titan.plan``). Before that it was neither: every rank
+        ran every row, so ``dp_shard`` bought memory and no throughput, and
+        ``micro_rows`` rows per forward meant a 480-row window was 480
+        forwards whatever the rows were made of.
+
+        There is also no separate scoring pass any more. The value step is a
+        single optimiser update over gradient-accumulated micro-batches, so
+        every forward inside it already runs on the pre-update weights -- the
+        same weights a scoring pass would have used, over the same rows. The
+        values come back out of that forward instead of being recomputed, so
+        "score with the pre-update V, publish, then update it" still holds
+        exactly, at one forward per row rather than two.
+        """
         from meshy.backend.titan.critic.data import samples_from_rows
-        from meshy.backend.titan.critic.gae import compute_returns
-        from meshy.backend.titan.critic.metrics import critic_diagnostics
+        from meshy.backend.titan.critic.gae import (
+            advantages_to_per_sequence,
+            compute_returns,
+            compute_vapo_gae,
+        )
+        from meshy.backend.titan.critic.metrics import (
+            Accumulator,
+            diagnostics_from_states,
+        )
 
         if self.critic is None:
             raise RuntimeError("CriticSpmdEngine.score_and_train() called before init()")
@@ -201,105 +236,117 @@ class CriticSpmdEngine(SpmdEngine):
         publish = bool(broadcast["publish"])
         batch_samples = samples_from_rows(rows)
 
-        # ---- 1. score with the CURRENT value function -------------------
-        # Before any update, so the values the actor receives come from the
-        # value function that did not see this window.
-        per_seq: list[float] = []
-        per_row_values: list[torch.Tensor] = []
-        values, returns, masks, row_rewards, group_ids = [], [], [], [], []
+        # ---- 1. plan: this rank's rows, packed into micro-batches --------
+        plan, dp_rank = self._plan_window(batch_samples)
+        local = plan.local_samples(batch_samples, dp_rank)
+        local_indices = plan.local_indices[dp_rank]
+        # ``mini_batch_size`` is the whole local shard, so there is exactly one
+        # mini-batch -- one optimiser step per window, which is the clock
+        # recipe §2 counts in ("10 iter lr warmup" = 10 rollout steps).
+        micros = plan.per_rank[dp_rank][0].micros
+
         micro_batches: list[tuple[Any, ...]] = []
-        for lo in range(0, len(batch_samples), self.micro_rows):
-            chunk = batch_samples[lo : lo + self.micro_rows]
-            n_docs = len(chunk)
-            # One build per chunk, on CPU: the scoring forward takes a device
-            # copy and the value step below consumes the CPU tensors directly.
-            # Building it twice (once per phase) doubled the padding and the
-            # host-side tensor construction for every row of the window.
-            b = self.critic.make_batch(chunk, device="cpu")
-            on_device = {
-                key: tensor.to(self.critic.device, non_blocking=True)
-                for key, tensor in b.items()
-            }
-            if self.publish_mode == "advantage":
-                _, adv_seq, v = self.critic.predict_vapo_gae(
-                    on_device["input_ids"], on_device["positions"],
-                    on_device["rewards"], on_device["mask"],
-                    on_device["doc_ids"], n_docs, gamma=self.gamma, alpha=self.alpha,
-                )
-                per_seq.extend(float(x) for x in adv_seq.detach().float().cpu().tolist())
-            else:
-                # The trainer runs GAE itself, so the critic owes it only the
-                # value function. Running the recursion here too would be a
-                # second full-length scan per row for a number nobody reads.
-                v = self.critic.predict_values(
-                    on_device["input_ids"], on_device["positions"]
-                )
-            # ``v`` is the pre-update value function -- the same forward the
-            # gauges describe and, in ``values`` mode, exactly what is
-            # published, so the actor's advantage cannot be contaminated by
-            # this window's own value step.
-            v_host = v.detach().float().cpu()
-            # Published per row and trimmed to the row's own length: the padded
-            # tail is not part of the sample and the trainer slices by ``L``.
-            per_row_values.extend(
-                v_host[j, : len(chunk[j].tokens)].clone() for j in range(n_docs)
+        built: list[tuple[Any, dict[str, torch.Tensor], torch.Tensor]] = []
+        for m in micros:
+            chunk = [local[p] for p in m.sample_idx]
+            # Filler micro-batches keep the number of forwards equal across
+            # ranks; FSDP issues collectives per forward/backward, so a rank
+            # with fewer would hang the others. They carry an all-zero mask and
+            # contribute exactly zero to both the loss and its denominator.
+            b = (
+                self.critic.make_batch(chunk, device="cpu", pad_to=m.seq_len)
+                if chunk
+                else self._filler_batch(m.seq_len)
             )
             targets = compute_returns(
                 b["rewards"], b["mask"], b["doc_ids"], gamma=self.gamma
             )
-            values.append(v_host)
-            returns.append(targets)
-            masks.append(b["mask"])
-            row_rewards.append(b["row_rewards"])
-            group_ids.append(b["group_ids"])
             micro_batches.append(
                 (b["input_ids"], b["positions"], targets, b["mask"], None)
             )
+            built.append((m, b, targets))
 
-        # ---- 2. gauges, from those same pre-update values ---------------
-        diagnostics = critic_diagnostics(
-            _cat_padded(values), _cat_padded(returns), _cat_padded(masks),
-            torch.cat(row_rewards), torch.cat(group_ids),
+        # ---- 2. fit the value net, keeping the pre-update forward --------
+        # Queued micro-batches stay on CPU; the engine moves one at a time to
+        # the device immediately before its forward. Only the first epoch's
+        # values are the pre-update ones -- a later epoch sees weights this
+        # window already moved.
+        losses: list[float] = []
+        window_values: list[torch.Tensor] = []
+        for epoch in range(max(1, self.value_epochs)):
+            loss, collected = self.critic.train_value_accumulated(
+                micro_batches, collect_values=(epoch == 0)
+            )
+            losses.append(loss)
+            if epoch == 0:
+                window_values = collected
+
+        # ---- 3. gauges and the published column, per local row -----------
+        if len(window_values) != len(built):
+            # ``zip`` would truncate silently, and a window short of rows only
+            # surfaces later as a wrong gauge or a missing published column.
+            raise RuntimeError(
+                f"value step returned {len(window_values)} micro-batches of "
+                f"values for {len(built)} micro-batches"
+            )
+        accumulator = Accumulator()
+        published: dict[int, Any] = {}
+        for (m, b, targets), v in zip(built, window_values):
+            if m.is_filler:
+                continue
+            accumulator.update(
+                v, targets, b["mask"], b["row_rewards"], b["group_ids"]
+            )
+            if not publish:
+                continue
+            if self.publish_mode == "advantage":
+                adv, _ = compute_vapo_gae(
+                    b["rewards"], v, b["mask"], b["doc_ids"], len(m.sample_idx),
+                    gamma=self.gamma, alpha=self.alpha,
+                )
+                per_seq = advantages_to_per_sequence(
+                    adv * b["mask"], b["mask"], b["doc_ids"], len(m.sample_idx)
+                )
+                for j, p in enumerate(m.sample_idx):
+                    published[local_indices[p]] = float(per_seq[j])
+            else:
+                # Trimmed to the row's own length: the padded tail is not part
+                # of the sample and the trainer slices by ``L``.
+                for j, p in enumerate(m.sample_idx):
+                    published[local_indices[p]] = v[j, : len(local[p].tokens)].clone()
+
+        # ---- 4. back to rank 0 -------------------------------------------
+        gathered = self._gather_to_master(
+            {"diagnostics": accumulator.state, "published": published}
+            if self._dp_representative
+            else None
         )
-
-        # ---- 3. now update the value net --------------------------------
-        # One optimiser step per window, not per row. ``micro_rows`` bounds the
-        # rows resident on the GPU for a single forward/backward; it must not
-        # also set the update granularity. Stepping per chunk would make a
-        # 480-row window 480 updates, put the whole ``warmup_steps`` warmup
-        # inside the first window's first few rows, and give every update the
-        # gradient of a single sequence -- none of which is recipe §2, which
-        # counts critic iterations in rollout steps ("~25 steps before
-        # value_loss enters its normal range", "10 iter lr warmup").
-        #
-        # ``train_value_accumulated`` takes the whole window's micro-batches,
-        # normalises every one of them by the window-global assistant-token
-        # count across DP and CP, and applies a single warmup + clip + step
-        # after they have all contributed gradients -- mathematically one fit
-        # on the concatenated window at micro-batch peak memory. Queued
-        # micro-batches stay on CPU; the engine moves one at a time to the
-        # device immediately before its forward (same pattern as
-        # ``scripts/critic_train_trajectory.py``). The micro-batches were built
-        # by the scoring loop above, which is also what guarantees the value
-        # step regresses onto exactly the targets the gauges reported.
-        losses: list[float] = [
-            self.critic.train_value_accumulated(micro_batches)
-            for _ in range(max(1, self.value_epochs))
-        ]
-
         if not self.is_master:
             return None
+
         result: dict[str, Any] = {
             "value_loss": sum(losses) / max(1, len(losses)),
             "rows": len(batch_samples),
-            "diagnostics": diagnostics,
+            "diagnostics": diagnostics_from_states(
+                [p["diagnostics"] for p in gathered if p is not None]
+            ),
         }
         if publish:
             from tensordict import TensorDict
 
+            by_index: dict[int, Any] = {}
+            for part in gathered:
+                if part is not None:
+                    by_index.update(part["published"])
+            if len(by_index) != len(batch_samples):
+                raise RuntimeError(
+                    f"critic published {len(by_index)} rows for "
+                    f"{len(batch_samples)} input rows; the DP plan lost some"
+                )
+            ordered = [by_index[i] for i in range(len(batch_samples))]
             if self.publish_mode == "values":
                 result["values"] = [
-                    TensorDict({"values": v}, batch_size=[]) for v in per_row_values
+                    TensorDict({"values": v}, batch_size=[]) for v in ordered
                 ]
             else:
                 result["advantage"] = [
@@ -307,9 +354,83 @@ class CriticSpmdEngine(SpmdEngine):
                         {"advantage": torch.tensor(float(a), dtype=torch.float32)},
                         batch_size=[],
                     )
-                    for a in per_seq
+                    for a in ordered
                 ]
         return result
+
+    # ── window planning / result collection ─────────────────────────────
+    def _plan_window(self, batch_samples: list[Any]) -> tuple[Any, int]:
+        """The DP split and micro-batch packing for one window.
+
+        Every rank runs this on the same broadcast row list and therefore
+        derives the same plan without communicating it -- the same contract
+        ``meshy.backend.titan.parallel.split_batch_to_local`` relies on. The
+        ``Plan`` itself is kept (rather than going through that helper) because
+        the critic needs ``local_indices`` to put each row's value back under
+        its original position in the window.
+        """
+        from meshy.backend.titan.parallel import dp_rank_and_size
+        from meshy.backend.titan.plan import PlannerConfig, build_plan
+
+        dp_rank, dp_size = dp_rank_and_size(self.critic.parallel_dims)
+        lengths = [len(s.tokens) for s in batch_samples]
+        # The value loss lives on the shifted assistant mask; the shift never
+        # drops a response token (a response never starts at index 0), so the
+        # row's response-token count is that denominator.
+        loss_tokens = [s.n_response for s in batch_samples]
+        cfg = PlannerConfig(
+            # ``padded`` keeps plain causal attention, which is what
+            # torchtitan's ring-attention CP needs; ``packed`` (varlen) is not
+            # available under CP.
+            layout="padded",
+            # One optimiser step per window: the mini-batch is the whole local
+            # shard.
+            mini_batch_size=max(1, len(batch_samples) // max(1, dp_size)),
+            seq_len=self.critic.seq_len,
+            align=self.critic.seq_align,
+            max_tokens_per_micro=self.max_tokens_per_micro,
+            micro_batch_size=None if self.max_tokens_per_micro else self.micro_rows,
+        )
+        return build_plan(lengths, loss_tokens, dp_size, cfg), dp_rank
+
+    def _filler_batch(self, seq_len: int) -> dict[str, torch.Tensor]:
+        """A one-row zero batch: same collectives, no contribution to the loss."""
+        zeros_f = torch.zeros(1, seq_len, dtype=torch.float32)
+        return {
+            "input_ids": torch.zeros(1, seq_len, dtype=torch.long),
+            "positions": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
+            "mask": zeros_f,
+            "doc_ids": torch.zeros(1, seq_len, dtype=torch.long),
+            "rewards": zeros_f.clone(),
+            "row_rewards": torch.zeros(1, dtype=torch.float32),
+            "group_ids": torch.zeros(1, dtype=torch.long),
+        }
+
+    @property
+    def _dp_representative(self) -> bool:
+        """Whether this rank speaks for its DP shard when results go to rank 0.
+
+        Ranks inside a CP (or TP) group all hold the same rows, and
+        ``gather_seq`` has already given them the same values, so having every
+        one of them ship its copy would multiply the gathered payload by the CP
+        degree for nothing.
+        """
+        dims = self.critic.parallel_dims
+        if dims.cp_enabled and dims.get_mesh("cp").get_local_rank() != 0:
+            return False
+        if dims.tp_enabled and dims.get_mesh("tp").get_local_rank() != 0:
+            return False
+        return True
+
+    def _gather_to_master(self, payload: Any) -> list[Any]:
+        """Collect one payload per rank on rank 0; ``[]`` elsewhere."""
+        if self.world_size == 1:
+            return [payload]
+        import torch.distributed as dist
+
+        out: list[Any] | None = [None] * self.world_size if self.is_master else None
+        dist.gather_object(payload, out, dst=0, group=self.group_gloo)
+        return out if out is not None else []
 
     # ── colocation ──────────────────────────────────────────────────────
     def offload_to_cpu(self) -> None:
@@ -380,22 +501,6 @@ class CriticSpmdEngine(SpmdEngine):
 
     def health_info(self) -> dict[str, Any]:
         return {"train_steps": getattr(self.critic, "train_steps", 0)}
-
-
-def _cat_padded(chunks: list[torch.Tensor]) -> torch.Tensor:
-    """Concatenate ``[rows, S_i]`` chunks along rows, right-padding to max S."""
-    if len(chunks) == 1:
-        return chunks[0]
-    width = max(c.shape[1] for c in chunks)
-    return torch.cat(
-        [
-            c
-            if c.shape[1] == width
-            else torch.cat([c, c.new_zeros(c.shape[0], width - c.shape[1])], dim=1)
-            for c in chunks
-        ],
-        dim=0,
-    )
 
 
 __all__ = ["CriticSpmdEngine"]

@@ -355,9 +355,16 @@ class CriticServiceConfig(ServiceConfig):
     #: Rows resident on the GPU per critic forward. This bounds memory only --
     #: the value step still accumulates over the whole window and takes one
     #: optimiser step (recipe §2 counts critic iterations in rollout steps).
-    #: At 128k a single row already fills the card; raise it for short-context
-    #: runs, where one row per forward wastes most of the batch dimension.
+    #: Ignored when ``max_tokens_per_micro`` is set, which is the form to
+    #: prefer: a fixed row count has to be sized for the *longest* row in a
+    #: window, and at 128k the rows span two orders of magnitude, so it spends
+    #: most forwards on a nearly empty batch dimension.
     micro_rows: int = 1
+    #: Token budget per critic forward (rows x padded row length). The planner
+    #: sorts the window by length and packs to this, so short rows ride
+    #: together and only genuinely long ones get a forward to themselves.
+    #: ``None`` falls back to ``micro_rows``.
+    max_tokens_per_micro: int | None = None
     #: Train the whole backbone, not just the value head. A value-head-only
     #: critic is a linear probe on frozen features and measurably plateaus
     #: before it beats the whitening baseline (var_reduction stays < 0).

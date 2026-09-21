@@ -20,17 +20,34 @@ All four take per-token tensors in the padded ``[rows, S]`` layout plus a
 ``group_ids`` array saying which prompt each row came from. They are pure
 tensor/numpy work with no distributed calls, so they run identically offline
 over a trajectory dump and online inside a trainer.
+
+Streaming
+---------
+:func:`critic_diagnostics` wants the whole window as one ``[rows, S]``
+rectangle, which the live critic cannot afford: its micro-batches are sized by
+a token budget and split across DP ranks, so assembling that rectangle would
+pad every row of a window out to the longest one (480 x 128k x fp32 = 244 MiB
+per tensor) and would need the other rank's rows besides. :class:`Accumulator`
+is the same four gauges expressed as running sums instead, so each rank folds
+in its own micro-batches as they are produced and
+:func:`diagnostics_from_states` merges the per-rank partials on the master.
+The token-level gauges are exactly reconstructible from sums because every one
+of them is a mean or a variance over masked tokens; the two per-prompt gauges
+need only one scalar per *row*, which is small enough to ship.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 import torch
 
 __all__ = [
+    "Accumulator",
+    "AccumulatorState",
     "CriticDiagnostics",
     "critic_diagnostics",
+    "diagnostics_from_states",
     "prompt_pearson",
     "within_prompt_auc",
     "variance_reduction",
@@ -195,4 +212,111 @@ def critic_diagnostics(
         n_rows=int(values.shape[0]),
         n_prompts=int(torch.unique(group_ids).numel()),
         n_tokens=int(m.sum().item()),
+    )
+
+
+@dataclass
+class AccumulatorState:
+    """One rank's partial gauges — plain floats, so it survives a pickle.
+
+    The token-level fields are sums over masked tokens of ``r`` (the return)
+    and ``d = V - r``; every token-level gauge is a ratio of those. The
+    row-level lists carry one entry per row this rank owned, which is what the
+    two per-prompt gauges need.
+    """
+
+    n_tokens: float = 0.0
+    sum_r: float = 0.0
+    sum_r2: float = 0.0
+    sum_d: float = 0.0
+    sum_d2: float = 0.0
+    row_value: list[float] = field(default_factory=list)
+    row_reward: list[float] = field(default_factory=list)
+    row_group: list[int] = field(default_factory=list)
+
+
+class Accumulator:
+    """Fold ``[rows, S]`` micro-batches into an :class:`AccumulatorState`.
+
+    Assumes a 0/1 ``mask``, which is what
+    :func:`meshy.backend.titan.critic.data.make_batch` produces: the gauges are
+    then identical to :func:`critic_diagnostics` on the concatenated window.
+    """
+
+    def __init__(self) -> None:
+        self.state = AccumulatorState()
+
+    @torch.no_grad()
+    def update(
+        self,
+        values: torch.Tensor,     # [rows, S] per-token V
+        returns: torch.Tensor,    # [rows, S] per-token return-to-go
+        mask: torch.Tensor,       # [rows, S] float assistant mask
+        rewards: torch.Tensor,    # [rows] sequence reward
+        group_ids: torch.Tensor,  # [rows] prompt index
+    ) -> None:
+        s = self.state
+        m = (mask > 0).float()
+        v, r = values.float() * m, returns.float() * m
+        d = v - r
+
+        s.n_tokens += float(m.sum().item())
+        s.sum_r += float(r.sum().item())
+        s.sum_r2 += float((r * r).sum().item())
+        s.sum_d += float(d.sum().item())
+        s.sum_d2 += float((d * d).sum().item())
+
+        # ``_response_mean`` with the same clamp, so a row with no masked
+        # token contributes 0 here exactly as it does there.
+        row_value = v.sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+        s.row_value.extend(float(x) for x in row_value.tolist())
+        s.row_reward.extend(float(x) for x in rewards.float().tolist())
+        s.row_group.extend(int(x) for x in group_ids.tolist())
+
+
+def diagnostics_from_states(
+    states: "list[AccumulatorState]",
+    *,
+    correct_threshold: float = 0.5,
+) -> CriticDiagnostics:
+    """Merge per-rank partials into the same verdict :func:`critic_diagnostics` gives.
+
+    Rows may arrive in any order and from any rank: the two per-prompt gauges
+    are permutation-invariant (they group by ``group_ids``) and the token-level
+    ones are sums, so the merge needs no ordering contract with the caller.
+    """
+    n = sum(s.n_tokens for s in states)
+    if n <= 0:
+        raise ValueError("cannot build diagnostics from states with no masked tokens")
+    sum_r = sum(s.sum_r for s in states)
+    sum_r2 = sum(s.sum_r2 for s in states)
+    sum_d = sum(s.sum_d for s in states)
+    sum_d2 = sum(s.sum_d2 for s in states)
+
+    # Var(x) = E[x^2] - E[x]^2, the ``unbiased=False`` form the tensor gauges use.
+    var_r = sum_r2 / n - (sum_r / n) ** 2
+    var_d = sum_d2 / n - (sum_d / n) ** 2
+    var_ratio = float("nan") if var_r == 0.0 or n < 2 else 1.0 - var_d / var_r
+
+    row_value = torch.tensor(
+        [x for s in states for x in s.row_value], dtype=torch.float32
+    )
+    row_reward = torch.tensor(
+        [x for s in states for x in s.row_reward], dtype=torch.float32
+    )
+    group_ids = torch.tensor(
+        [x for s in states for x in s.row_group], dtype=torch.long
+    )
+
+    return CriticDiagnostics(
+        value_loss=sum_d2 / n,
+        critic_auc=within_prompt_auc(
+            row_value, row_reward >= correct_threshold, group_ids
+        ),
+        critic_var_ratio=var_ratio,
+        critic_calibration_gap=sum_d / n,
+        prompt_pearson=prompt_pearson(row_value, row_reward, group_ids),
+        n_rows=int(row_value.numel()),
+        n_prompts=int(torch.unique(group_ids).numel()),
+        n_tokens=int(n),
     )

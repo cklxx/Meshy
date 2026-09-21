@@ -93,12 +93,21 @@ only the train/inference logprob gap — the thing TIS covers — reaches the
 clip); five keeps §1's clip-higher load-bearing without shrinking an update to
 a single prompt group.
 
-The critic's own tempo: `CriticSpmdEngine.micro_rows` bounds the rows resident
-on the GPU per forward, *not* the update granularity — `engine/critic.py` feeds
+The critic's own tempo: `max_tokens_per_micro` bounds the tokens resident on
+the GPU per forward, *not* the update granularity — `engine/critic.py` feeds
 the whole window to `train_value_accumulated`, so the critic takes
 `value_epochs` steps per window. That is what makes §2's markers legible:
 `warmup_steps=10` is 10 rollout steps, and "value_loss enters its normal range
 after ~25 steps" is 25 windows.
+
+The window is also split across the critic's DP mesh (`dp_shard_degree=2`), so
+each rank fits 240 of the 480 rows and the two shards' gradients meet in FSDP's
+reduce. Both halves of that — the DP split and the token-budget packing — come
+from the same planner the actor uses (`backend/titan/plan.py`), and together
+with dropping the critic's separate scoring forward (the value step's own
+forward already runs on the pre-update weights, so it *is* the scoring pass)
+they are why the critic is no longer the dominant term in a window's wall
+clock.
 
 Run length
 ----------
@@ -446,10 +455,24 @@ def _critic_group() -> ServiceGroup:
             # pre-update V, publish, then take the value step); it just no
             # longer collapses the result to one number per sequence.
             publish_mode="values",
-            # Rows per critic forward. One 128k row already fills a CP rank;
-            # this bounds memory only -- the value step still accumulates over
+            # Tokens per critic forward (rows x padded row length), not rows.
+            # The window's rows span two orders of magnitude -- p50 ~10k, p90
+            # ~40k, p99 ~95k on this dataset -- so a fixed row count is sized
+            # for the longest row and leaves the batch dimension nearly empty
+            # for the other 90%. With a budget the planner sorts by length and
+            # packs to it: short rows share a forward, a 95k row still gets one
+            # to itself. On this run's length distribution that is 480 forwards
+            # per window -> 73 per rank.
+            #
+            # The budget cannot raise peak activation memory above what the
+            # run already survived: a row longer than the budget is placed
+            # alone regardless, so the peak is set by the longest *row*
+            # (126976, i.e. 32k per rank under CP4), not by the budget. 65536
+            # is 16k per rank -- half that.
+            #
+            # This bounds memory only -- the value step still accumulates over
             # the whole window and takes a single optimiser step.
-            micro_rows=1,
+            max_tokens_per_micro=65536,
             # §2: a value-head-only critic is a linear probe on frozen
             # features and plateaus before it beats the whitening baseline.
             train_backbone=True,

@@ -21,7 +21,13 @@ from .gae import (
     compute_returns,
     compute_vapo_gae,
 )
-from .metrics import CriticDiagnostics, critic_diagnostics
+from .metrics import (
+    Accumulator,
+    AccumulatorState,
+    CriticDiagnostics,
+    critic_diagnostics,
+    diagnostics_from_states,
+)
 from .model import CriticModel
 from .parallel import parallelize_critic
 
@@ -43,6 +49,9 @@ __all__ = [
     "split_by_prompt",
     "make_batch",
     # critic health
+    "Accumulator",
+    "AccumulatorState",
     "CriticDiagnostics",
     "critic_diagnostics",
+    "diagnostics_from_states",
 ]
