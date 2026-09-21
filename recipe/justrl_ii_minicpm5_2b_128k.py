@@ -334,11 +334,44 @@ def _inference_group() -> ServiceGroup:
     # Concurrency: the rollout caps itself at `2 * BATCH_SIZE` = 960 samples in
     # flight, i.e. 120 per instance against `max_running_requests=64`. The
     # surplus queues inside SGLang, which is the intended behaviour -- a queued
-    # request holds no KV, and the 64 that do run get 1_440_000 / 64 = 22.5k
+    # request holds no KV, and the 64 that do run get 1_200_000 / 64 = 18.75k
     # tokens of budget each. Raise `max_running_requests` only if the queue is
     # demonstrably starving the GPU; lower it if the logs show frequent
     # retract/preempt. Do not raise `mem_fraction_static`, which the colocation
     # hand-off has to release and restore every window.
+    #
+    # Why 0.80 and not the 0.88 this used to carry: `offload_to_cpu()` +
+    # `empty_cache()` on the trainer and the critic do *not* return the whole
+    # card. The CUDA context, the FSDP2/CP4 NCCL buffers and the cuBLAS
+    # workspaces stay resident for the life of the process, and on
+    # 20260918-022946 that was **4.33 GiB (actor_train rank 0) + 7.33 GiB
+    # (critic rank 0) = 11.7 GiB** still pinned on GPU 0 while SGLang thought
+    # it owned the card. 0.88 x 79.18 = 69.7 GiB budget against 79.18 - 11.7 =
+    # 67.5 GiB actually available, so SGLang ran with no headroom at all and
+    # died at 20:02:45 on a 1018 MiB prefill input-logprob chunk (2048 tok x
+    # 130560 vocab x fp32) with 927 MiB free -- taking the colocation manager
+    # and the whole 8-card job with it.
+    #
+    #   0.80 x 79.18 = 63.3 GiB budget
+    #   + 11.7 GiB colocation residency = 75.0 GiB of 79.18  ->  ~4 GiB spare
+    #
+    # `max_total_tokens` comes down with it, because the two have to agree:
+    # KV is 2 kv_heads x 128 head_dim x 42 layers x 2 (K+V) x 2 B = 43008
+    # B/token, so 1_440_000 tokens is 57.7 GiB of KV and, with ~8.9 GiB of
+    # non-KV residency measured on that run, 66.6 GiB total -- i.e. the *token
+    # cap*, not the fraction, was what actually sized the pool. SGLang clamps
+    # `min(profiled, max_total_tokens)` (`kv_cache_configurator.py::
+    # _apply_token_constraints`) and only warns, so leaving 1_440_000 here
+    # would silently hand the pool back to the profiler and make this comment
+    # a lie. 1_200_000 x 43008 B = 51.6 GiB of KV, 60.5 GiB total.
+    #
+    # The cost is per-request budget: 22.5k -> 18.75k tokens against a p50
+    # response of ~10k and a mean of ~18k. That run was already retracting at
+    # token usage 1.00, so expect retract/re-prefill to get *more* frequent,
+    # not less. Retraction is graceful and OOM is not, so this is the right
+    # side to err on -- but if the churn dominates the window, drop
+    # `max_running_requests` to 48 (25k each) before touching either number
+    # here.
     return ServiceGroup(
         id="actor_infer",
         n_replicas=NUM_CARDS,
@@ -349,9 +382,9 @@ def _inference_group() -> ServiceGroup:
                 "model_path": MODEL_PATH,
                 "tp_size": 1,
                 "attention_backend": "fa3",
-                "mem_fraction_static": 0.88,
+                "mem_fraction_static": 0.80,
                 "max_running_requests": 64,
-                "max_total_tokens": 1440000,
+                "max_total_tokens": 1200000,
                 "schedule_conservativeness": 1.2,
                 "enable_memory_saver": True,
             },
