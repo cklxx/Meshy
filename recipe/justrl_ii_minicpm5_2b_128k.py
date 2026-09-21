@@ -210,9 +210,17 @@ NUM_EPOCHS = 1
 #: (one epoch, minus cold start); see "Run length" in the module docstring.
 NUM_STEPS = 600
 
-#: §2 cold start. The recipe uses 30; the env override exists so the
+#: §2 cold start. 20, not the 30 this used to carry: 30 was budgeted for a
+#: value head that started units away from its target and had to walk back
+#: (run 20260918-022946 opened at value_loss=10.85 and burned ~16 windows just
+#: getting under 1.0, then exited at 30/30 with var_reduction=-0.044 -- still
+#: worse than no baseline). With the head zero-initialised the opening loss is
+#: E[R^2] ~ 0.55 and the whole budget goes on learning, so the reference
+#: implementation cut the same knob to 20 (miles phx_0711_ppo b83c97dc5,
+#: measured out-of-warmup by step 17-18; `--critic-lr-warmup-iters 10` is
+#: unchanged, and so is `warmup_steps` below). The env override exists so the
 #: cold-start -> publish transition can be reached quickly in a smoke run.
-COLD_START_WINDOWS = int(os.environ.get("XRL_COLD_START_WINDOWS", "30"))
+COLD_START_WINDOWS = int(os.environ.get("XRL_COLD_START_WINDOWS", "20"))
 CRITIC_SCORE_BATCH = int(os.environ.get("XRL_CRITIC_SCORE_BATCH", str(BATCH_SIZE)))
 
 
