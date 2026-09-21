@@ -129,6 +129,17 @@ class TQWorker(Worker):
     def startup_tq_outputs(self) -> Mapping[str, Any]:
         return {}
 
+    def should_clear_batch(self) -> bool:
+        """Whether the batch just written should be cleared from the partition.
+
+        Defaults to the static :attr:`TQInput.clear_after_success`. Override for
+        a worker whose ownership of the rows changes over its lifetime -- the
+        critic, for instance, consumes rows outright during its cold-start
+        phase, then hands them on to the trainer once it starts publishing
+        advantages.
+        """
+        return self.tq_input is not None and self.tq_input.clear_after_success
+
     def _connect_tq(self) -> Any:
         if self._tq_client_factory is not None:
             return self._tq_client_factory(self.tq_endpoints_ref)
@@ -231,7 +242,7 @@ class TQWorker(Worker):
             retries=self.tq_max_retries,
             batch_size=meta.size,
         )
-        if self.tq_input.clear_after_success:
+        if self.should_clear_batch():
             self._retry_phase(
                 "clear",
                 lambda: client.clear_samples(meta),

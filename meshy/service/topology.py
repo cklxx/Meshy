@@ -284,7 +284,56 @@ def build_topology(
 
     _attach_colocations(services, colocations or [])
     _validate_ports(services)
+    _validate_critic_columns(services)
     return Topology(services)
+
+
+def _validate_critic_columns(services: list[ServiceInfo]) -> None:
+    """Reject a critic/trainer pair that disagrees about the advantage column.
+
+    TransferQueue's AND-filter is the only thing sequencing rollout -> critic
+    -> trainer, so the column names *are* the wiring. If the critic publishes
+    ``values`` while the trainer still gates on ``advantage``, nothing errors:
+    the critic scores every window, the trainer's fetch never matches, and the
+    run simply stops producing steps after the cold start -- with healthy logs
+    on both sides. Catch it before any process starts.
+    """
+    from meshy.config import CRITIC_OUTPUT_FIELDS_BY_MODE
+
+    critics = [s for s in services if s.role == "critic"]
+    trainers = [s for s in services if s.role == "training"]
+    if not critics or not trainers:
+        return
+    for critic in critics:
+        mode = getattr(critic.config, "publish_mode", "advantage")
+        published = set(CRITIC_OUTPUT_FIELDS_BY_MODE[mode])
+        for trainer in trainers:
+            fetched = set(getattr(trainer.config, "tq_fields", ()))
+            if not published <= fetched:
+                raise ValueError(
+                    f"critic {critic.name!r} publishes {sorted(published)} "
+                    f"(publish_mode={mode!r}) but trainer {trainer.name!r} "
+                    f"fetches {sorted(fetched)}. The trainer would never see a "
+                    f"scored row. Set the trainer's tq_fields to "
+                    f"meshy.config.GAE_TRAINER_FIELDS (plus 'raw_reward' when "
+                    f"the rollout shapes the reward) for publish_mode='values', "
+                    f"or set publish_mode='advantage' on the critic."
+                )
+            params = getattr(trainer.config, "trainer_params", None)
+            enable_gae = bool(getattr(params, "enable_gae", False))
+            if mode == "values" and not enable_gae:
+                raise ValueError(
+                    f"critic {critic.name!r} publishes per-token values but "
+                    f"trainer {trainer.name!r} has enable_gae=False, so nothing "
+                    f"would turn them into advantages. Set "
+                    f"TrainerParamsConfig(enable_gae=True)."
+                )
+            if mode != "values" and enable_gae:
+                raise ValueError(
+                    f"trainer {trainer.name!r} has enable_gae=True but critic "
+                    f"{critic.name!r} publishes {sorted(published)}, not "
+                    f"per-token values. Set publish_mode='values' on the critic."
+                )
 
 
 def _attach_colocations(

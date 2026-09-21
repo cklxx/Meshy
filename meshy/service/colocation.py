@@ -41,6 +41,11 @@ class ColocationRing:
     group_id: str
     ring: tuple[RingNode, ...]
     poll_interval: float = 1.0
+    #: How long (seconds) an ON_DEMAND service waits for the next ring member to
+    #: post its GPU request before giving the token back to the FALLBACK owner.
+    #: Prevents a spurious fallback window when the next stage has not yet
+    #: fetched its TQ batch at the moment the current stage calls release().
+    next_owner_timeout: float = 3.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ring", tuple(RingNode(node[0], SchedulingMode(node[1])) for node in self.ring))
@@ -55,6 +60,8 @@ class ColocationRing:
             raise ValueError(f"colocation ring contains duplicates: {names}")
         if self.poll_interval <= 0:
             raise ValueError("colocation poll_interval must be positive")
+        if self.next_owner_timeout < 0:
+            raise ValueError("colocation next_owner_timeout must be >= 0")
 
     @property
     def initial_owner(self) -> str:
@@ -162,6 +169,11 @@ class ColocationManager:
         self._owner_service: str | None = None
         self._last_sequence = -1
         self._grant: GpuGrant | None = None
+        #: Re-entrancy guard for :meth:`_transfer`. Its phase-1 wait calls
+        #: :meth:`_reconcile`, which is itself what starts a preempt, so
+        #: without this the two call each other until the stack runs out. See
+        #: the comment on the guard in :meth:`_reconcile`.
+        self._transferring = False
 
     @property
     def owns_gpu(self) -> bool:
@@ -302,7 +314,22 @@ class ColocationManager:
             self._records[request_id] = record
             self._requests[request_id] = record.handle.request
             self._handles[request_id] = record.handle
-            if record.state == "open" and self.owns_gpu and self.mode is SchedulingMode.FALLBACK:
+            # A FALLBACK owner hands the card over as soon as anyone asks.
+            # ``not self._transferring`` is load-bearing: ``_transfer``'s
+            # phase-1 wait re-enters this method to pick up the next ring
+            # member's request, and at that point the card has not moved yet,
+            # so this branch is still true for the very request being
+            # transferred. Without the guard the two recurse until the stack
+            # runs out, killing the arbiter thread and stranding every waiter
+            # in ``wait_for_grant`` forever. It only bites once a *second*
+            # consumer contends -- while the next ring member is always the
+            # one asking, phase 1 never loops.
+            if (
+                record.state == "open"
+                and self.owns_gpu
+                and self.mode is SchedulingMode.FALLBACK
+                and not self._transferring
+            ):
                 self._transfer(transport, transition="preempt")
                 continue
             if record.grant is None:
@@ -385,6 +412,21 @@ class ColocationManager:
         candidates.sort(key=lambda item: item[:4])
         return candidates[0][4]
 
+    def _next_ring_member(self) -> str:
+        """Return the service_id of the member immediately after this one in the ring."""
+        owner_index = self.config.ring_index_for(self.service_id)
+        next_index = (owner_index + 1) % len(self.config.ring)
+        return self.config.ring[next_index].service_id
+
+    def _has_open_request_from(self, service_id: str) -> bool:
+        """Return True if ``service_id`` has an open (ungranted) GPU request."""
+        return any(
+            record.handle.request.service_id == service_id
+            and record.state == "open"
+            and record.grant is None
+            for record in self._records.values()
+        )
+
     def _transfer(
         self,
         transport: RequestLedgerTransport,
@@ -394,9 +436,60 @@ class ColocationManager:
     ) -> GpuGrant | None:
         if not self.owns_gpu:
             raise RuntimeError(f"service {self.service_id!r} does not own the GPU")
+        if self._transferring:
+            # Reached only through a path that bypassed the guard in
+            # ``_reconcile``; fail loudly rather than recursing.
+            raise RuntimeError(
+                f"colocation {self.config.group_id}: _transfer re-entered while "
+                f"a transfer from {self.service_id!r} was already in progress"
+            )
+        self._transferring = True
+        try:
+            return self._transfer_locked(
+                transport, transition=transition, payload_ref=payload_ref
+            )
+        finally:
+            self._transferring = False
+
+    def _transfer_locked(
+        self,
+        transport: RequestLedgerTransport,
+        *,
+        transition: str,
+        payload_ref: str | None = None,
+    ) -> GpuGrant | None:
+        # Phase 1: wait specifically for the next ring member to post a request.
+        # Even if another candidate is already waiting, we hold off until the
+        # immediately downstream stage has had a chance to call request_gpu().
+        # This preserves ring ordering and avoids a spurious fallback round-trip
+        # when the downstream stage hasn't yet fetched its TQ batch at the
+        # moment release() is called.
+        next_member = self._next_ring_member()
+        timeout = self.config.next_owner_timeout
+        deadline = time.monotonic() + timeout
+        while not self._has_open_request_from(next_member) and time.monotonic() < deadline:
+            time.sleep(0.5)
+            self._reconcile(transport.scan_requests(), transport)
+        # Phase 2: select the best available candidate via the normal selector.
+        # If the next member showed up it will win by ring-distance ordering;
+        # if it timed out we fall through to any other open request, or None
+        # (which lets _select_next restore the FALLBACK owner's request and
+        # return that on the recursive call).
         selected = self._select_next(transport)
         if selected is None:
+            logger.warning(
+                "Colocation {}: no ring member requested GPU after waiting {:.1f}s; "
+                "returning token to fallback owner",
+                self.config.group_id,
+                timeout,
+            )
             return None
+        # Vacate the card before the grant is published: once ``grant_request``
+        # lands, the target's manager may run its acquire callback at any
+        # moment, and two residencies on one card is the failure this ring
+        # exists to prevent. The inference engine also tracks it as state --
+        # ``resume_memory_occupation`` pops from ``offload_tags`` and raises
+        # ``KeyError`` on a resume that was never preceded by a release.
         self._on_release(selected.handle.request.service_id)
         current_request_id = self._grant.request_id if self._grant else None
         if current_request_id and current_request_id in self._handles:

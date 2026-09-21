@@ -58,6 +58,11 @@ class S9Math:
             raise ValueError(f"S9 JSONL dataset is empty: {path}")
         return records
 
+    @property
+    def n_prompts(self) -> int:
+        """Prompts in one epoch. Read by the rollout's oversampling budget."""
+        return len(self.records)
+
     def next_batch(self, builder: SampleBuilder) -> list[Sample]:
         if self.index >= len(self.records):
             return []

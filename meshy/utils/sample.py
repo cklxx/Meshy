@@ -11,8 +11,14 @@ class Sample:
     logprobs: Iterable[float]
     masks: Iterable[int]
     ground_truth: Any
+    #: The reward the trainer and the critic consume. With reward shaping
+    #: configured this is the *shaped* ``R``; without it, the raw task reward.
     reward: float
     advantage: float
+    #: The unshaped task reward, set only when shaping is configured. Published
+    #: as its own column so solve-rate metrics keep measuring correctness
+    #: rather than length (see :mod:`meshy.reward`).
+    raw_reward: float | None = None
     # Rollout-side quality stamps, filled by the rollout worker after the
     # response is generated (see :mod:`meshy.worker.rollout`).
     finish_reason: str | None = None
@@ -74,6 +80,29 @@ class SampleBuilder:
             sample.tokens.extend(ids)
             sample.logprobs.extend([logprob] * len(ids))
             sample.masks.extend([1 if role == "assistant" else 0] * len(ids))
+        return sample
+
+    def append_text(
+        self,
+        sample: Sample,
+        role: str,
+        content: str,
+        logprob: float = 0.0,
+        *,
+        add_generation_prompt: bool = True,
+    ) -> Sample:
+        old_messages = list(sample.messages)
+        old_ids = self._render(old_messages, add_generation_prompt=False)
+        new_messages = [*old_messages, {"role": role, "content": content}]
+        new_ids = self._render(new_messages, add_generation_prompt=add_generation_prompt)
+        if new_ids[:len(old_ids)] != old_ids:
+            raise ValueError("chat template changed the existing message prefix")
+
+        sample.messages.append({"role": role, "content": content})
+        ids = new_ids[len(old_ids):]
+        sample.tokens.extend(ids)
+        sample.logprobs.extend([logprob] * len(ids))
+        sample.masks.extend([1 if role == "assistant" else 0] * len(ids))
         return sample
 
     def append_tokens(

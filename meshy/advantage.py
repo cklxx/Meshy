@@ -3,20 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable
 
-
-def _first_response_length(mask: Iterable[int]) -> int:
-    """Return the length of the first contiguous run of ones in ``mask``."""
-    length = 0
-    in_response = False
-    for value in mask:
-        if value:
-            in_response = True
-            length += 1
-        elif in_response:
-            break
-    return length
+from meshy.reward import response_length as _first_response_length
 
 
 def _2_6_math_reshaped_advantage(
@@ -65,15 +53,20 @@ def _2_6_math_reshaped_advantage(
     shaped_rewards = list(raw_rewards)
 
     if buffer_len > 0:
-        expected_len = rollout_max_response_len - buffer_len
-        for i, response_length in enumerate(response_lengths):
-            if response_length > expected_len:
-                penalty = (
-                    (expected_len - response_length)
-                    / buffer_len
-                    * penalty_factor
-                )
-                shaped_rewards[i] += max(penalty, -penalty_factor)
+        # Same rule the rollout applies directly when a run uses an external
+        # critic and never reaches this function (:mod:`meshy.reward`).
+        from meshy.reward import soft_overlong_penalty
+
+        shaped_rewards = [
+            soft_overlong_penalty(
+                reward,
+                sample,
+                max_response_len=rollout_max_response_len,
+                buffer_len=buffer_len,
+                penalty_factor=penalty_factor,
+            )
+            for reward, sample in zip(shaped_rewards, samples)
+        ]
 
     if length_weight:
         correct = [i for i, reward in enumerate(raw_rewards) if reward > 0.5]
