@@ -195,14 +195,17 @@ class CriticEngine:
 
     @torch.no_grad()
     def load_backbone(self, hf_path: str) -> int:
-        """Load backbone weights from an HF checkpoint, keeping the value head random.
+        """Load backbone weights from an HF checkpoint, keeping the value head zeroed.
 
         Follows the actor's exact load path (``CheckpointManager.dcp_load``) so
         DTensor sharding under FSDP is handled:
         ``get_model_state_dict -> adapter.to_hf -> dcp.load(HF reader) ->
         adapter.from_hf -> set_model_state_dict``. The ``value_head`` keys are
         dropped before DCP and never overwritten, so the value head stays
-        randomly initialised (the recipe's cold-start requirement).
+        zero-initialised (the recipe's cold-start requirement, see
+        ``CriticModel.init_states``). This is also why the critic needs no
+        equivalent of miles' ``_rezero_critic_value_head``: the head never
+        shares a key with anything in the checkpoint.
 
         Returns the number of parameters loaded.
         """

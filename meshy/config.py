@@ -339,7 +339,8 @@ class CriticServiceConfig(ServiceConfig):
     endpoint_port_base: ClassVar[int] = 33000
     dist_port_base: ClassVar[int] = 43000
 
-    #: base model the backbone is loaded from; the value head stays random
+    #: base model the backbone is loaded from; the value head is never loaded
+    #: and stays zero-initialised
     model_path: str
     #: reuses the trainer config for seq_len / dtype / parallel degrees
     trainer_config: TrainerConfig

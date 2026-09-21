@@ -8,7 +8,8 @@ the actor trainer. It reuses the actor's *architecture* (the same
 a scalar per token. It deliberately does *not* enable weight tying: weight
 tying in the actor binds ``tok_embeddings`` to ``lm_head``, and the critic has
 no ``lm_head``. Backbone weights are meant to be loaded from the same base
-model as the actor (the value head stays randomly initialised).
+model as the actor; the value head is **zero-initialised** and never loaded
+(see :meth:`CriticModel.init_states`).
 
 Why a separate model instead of a forward hook on the actor: :meth:`Decoder.forward`
 only returns post-``lm_head`` logits, never the post-norm hidden state a value
@@ -104,7 +105,6 @@ class CriticModel(BaseModel):
         self.value_head = nn.Linear(config.dim, 1)
         # ``value_head`` is a submodule, so ``named_parameters(recurse=False)``
         # does not see its params; seed it explicitly in ``init_states``.
-        self._value_head_init_std = 0.02
 
     def init_states(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is None:
@@ -113,7 +113,34 @@ class CriticModel(BaseModel):
         # then seed the value head (``to_empty`` leaves it all zeros).
         super().init_states(buffer_device=buffer_device)
         with torch.no_grad():
-            nn.init.normal_(self.value_head.weight, std=self._value_head_init_std)
+            # ZERO init, not normal(0, 0.02). A [1, dim] projection with
+            # std=0.02 over a post-RMSNorm hidden state gives V a spread of
+            # 0.02 * sqrt(dim) * rms(h), which at dim=2048 is *units* wide
+            # against value targets that live in [0, 1]. The whole cold start
+            # then goes on walking that offset back down rather than on
+            # learning: run 20260918-022946 opened at value_loss=10.85 (RMSE
+            # ~3.3) and needed ~16 of its 30 cold-start windows just to get
+            # under 1.0, exited with var_reduction=-0.044 (still worse than no
+            # baseline at all), and spent the following 45 actor steps with
+            # calib_gap oscillating +-0.9 -- the head's *level* never settled.
+            #
+            # Zero init makes V == 0 at step 0, so the advantage degrades
+            # exactly to the (whitened) return -- the GRPO-equivalent
+            # failure-safe start -- while the gradient still flows, since
+            # dV/dw = h != 0. Expected opening value_loss is then E[R^2] ~ 0.55
+            # on this reward distribution instead of 10.85.
+            #
+            # This matches the reference implementation: miles
+            # ``model_provider.LinearForLastLayer`` zero-inits any
+            # ``output_size == 1`` head (phx_0711_ppo 1faf7ad4c). Note that
+            # miles needs a *second* guard that we do not: there the value head
+            # shares the ``output_layer.weight`` key with the LM head, and
+            # megatron's dist-ckpt reader silently fills the [1, H] head with
+            # row 0 of the [vocab, H] LM head. ``CriticEngine.load_backbone``
+            # drops the ``value_head`` keys before DCP and this model has no
+            # ``lm_head`` to collide with, so construction-time zeroing is the
+            # whole fix here.
+            nn.init.zeros_(self.value_head.weight)
             if self.value_head.bias is not None:
                 nn.init.zeros_(self.value_head.bias)
 
