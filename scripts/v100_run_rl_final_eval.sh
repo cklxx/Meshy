@@ -23,6 +23,8 @@ CKPT="$RUN_DIR/weights/actor_train-0/$V"
 OUT="/data00/meshy/rl/logs/final_eval_$(basename "$RUN_DIR")_${V}_$(date +%s).jsonl"
 echo "FINAL_EVAL checkpoint=$CKPT out=$OUT graph=$MESHY_SM70_CUDA_GRAPH"
 START=$(date +%s)
+# 8192 to match the 200x4 baseline protocol (eval200_4s lenient 0.7525 was
+# measured at 8192, not 4096).
 $PY scripts/eval_gsm8k.py --model "$CKPT" --n 200 --samples 4 \
-  --max-new-tokens 4096 --out "$OUT"
+  --max-new-tokens 8192 --out "$OUT"
 echo "FINAL_EVAL_DONE elapsed=$(( $(date +%s) - START ))s out=$OUT"
