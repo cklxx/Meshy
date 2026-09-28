@@ -194,9 +194,10 @@ def _trainer_config() -> TrainerConfig:
 
 def _trainer_params() -> TrainerParamsConfig:
     # Mirrors recipe/justrl: 8-sample mini-batch, micro 1, asymmetric clip,
-    # old logprobs recomputed inside the train pass.
+    # old logprobs recomputed inside the train pass. XRL_MINI_BATCH scales with
+    # the rollout window so optimizer updates/window stay 8 (64/8 or 512/64).
     return TrainerParamsConfig(
-        mini_batch_size=8,
+        mini_batch_size=int(os.environ.get("XRL_MINI_BATCH", "8")),
         micro_batch_size=1,
         seq_bucket=1024,
         ppo_clip_eps_low=0.2,
