@@ -38,7 +38,8 @@ GPU, rollout phase (trainer offloaded):
   ----------------------------------------------
   used                                 ~21 GiB of 32, headroom ~11
   KV per token = 2*28*8*128*2 = 114,688 B; 16 GiB => ~140 k KV tokens
-  (~70 seqs at 2048 tokens).
+  (~32 full 4.3k-token sequences worst case; median completion is ~485
+  tokens, so the 64-seq rollout window is KV-bound only on the long tail).
 
 GPU, training phase (KV pool released via memory saver; engine weights may
 stay resident, ~1.1 GiB):
@@ -46,11 +47,11 @@ stay resident, ~1.1 GiB):
   grads   fp32                       2.22 GiB
   AdamW exp_avg/exp_avg_sq fp32      4.44 GiB
   (FSDP all-gather casts the working copy to fp16 for each forward/backward)
-  activations (micro_batch=1, seq 1280,
+  activations (micro_batch=1, seq up to 5120,
     selective AC) + fp32 logits chunk
-    (1280 x 151936 x 4) + workspaces  ~2    GiB
+    (1024 x 151936 x 4) + workspaces  ~3    GiB
   ----------------------------------------------
-  peak                                ~11 GiB of 32
+  peak                                ~12 GiB of 32
   XRL_TRAIN_DTYPE=float16 cuts master+grad+state residency to 4.44 GiB but
   stalls lr=1e-6 updates; use only with a much larger lr.
 
@@ -112,8 +113,14 @@ class BoundedGSM8K(GSM8K):
 MODEL_PATH = os.environ.get("XRL_MODEL", "/data00/meshy/models/Qwen3-0.6B")
 MODEL_NAME = os.environ.get("XRL_MODEL_NAME", "qwen3")
 MODEL_FLAVOR = os.environ.get("XRL_MODEL_FLAVOR", "0.6B")
-SEQ_LEN = int(os.environ.get("XRL_SEQ_LEN", "1280"))
-MAX_NEW_TOKENS = int(os.environ.get("XRL_MAX_NEW_TOKENS", "1024"))
+SEQ_LEN = int(os.environ.get("XRL_SEQ_LEN", "5120"))
+# 4096 covers the p95 sampled completion (3992 tokens; 200-question x4 holdout
+# at temp 0.6/top_p 0.95/top_k 20). GSM8K prompts max out at 207 tokens, so
+# p95 prompt+completion fits in ~4200; 5120 is the smallest seq_bucket=1024
+# multiple above it (micro-batches still pad to the batch's own longest
+# bucket, not to seq_len). 1024 replaces the default 2048 bucket so the
+# ceiling is not forced onto a 2048 grid.
+MAX_NEW_TOKENS = int(os.environ.get("XRL_MAX_NEW_TOKENS", "4096"))
 
 # Shared 3FS root (FUSE-mounted on the V100). Checkpoints/dumps go under
 # ckpt/, the runtime root (weights + rollout trajectories) under rollout/.
@@ -180,6 +187,7 @@ def _trainer_params() -> TrainerParamsConfig:
     return TrainerParamsConfig(
         mini_batch_size=8,
         micro_batch_size=1,
+        seq_bucket=1024,
         ppo_clip_eps_low=0.2,
         ppo_clip_eps_high=0.28,
         old_logprobs_source="train",

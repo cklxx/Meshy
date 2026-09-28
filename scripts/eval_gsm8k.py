@@ -205,7 +205,33 @@ def main() -> None:
     ap.add_argument("--mem-fraction", type=float, default=0.6)
     ap.add_argument("--out", default="/data00/meshy/rl/logs/gsm8k_eval.jsonl")
     ap.add_argument("--server-log", default="/data00/meshy/rl/logs/eval_server.log")
+    ap.add_argument("--score-only", default=None,
+                    help="recompute the summary from an existing eval jsonl, no server")
     args = ap.parse_args()
+
+    if args.score_only:
+        rows = [json.loads(l) for l in open(args.score_only)]
+        n = max(r["q"] for r in rows) + 1
+        samples = len(rows) // n
+        per_q = {qi: [] for qi in range(n)}
+        for r in rows:
+            per_q[r["q"]].append(r["lenient"])
+        lengths = [r["tokens"] for r in rows]
+        acc = statistics.mean(sum(v) / len(v) for v in per_q.values())
+        strict_ok = sum(r["strict"] for r in rows)
+        strict_fmt = sum(r["pred_strict"] is not None for r in rows) / len(rows)
+        truncated = sum(r["finish"] == "length" for r in rows)
+        total = len(rows)
+        print(f"[score-only {args.score_only}]")
+        print(f"questions={n} samples/q={samples}")
+        print(f"lenient accuracy (per-q mean): {acc:.4f}")
+        print(f"strict accuracy: {strict_ok}/{total} = {strict_ok / total:.4f}")
+        print(f"strict format rate: {strict_fmt:.4f}")
+        print(f"truncation rate: {truncated}/{total} = {truncated / total:.4f}")
+        print(f"completion tokens p50/p90/p95/p99: "
+              f"{int(pct(lengths,50))}/{int(pct(lengths,90))}/{int(pct(lengths,95))}/{int(pct(lengths,99))}")
+        print(f"tokens min/max/mean: {min(lengths)}/{max(lengths)}/{int(statistics.mean(lengths))}")
+        return
 
     if args.greedy:
         args.samples = 1
@@ -269,7 +295,7 @@ def main() -> None:
     total = n * args.samples
     acc = statistics.mean(sum(v) / len(v) for v in per_q.values())
     strict_fmt = sum(1 for _, resp in responses
-                     if _extract_gsm8k_answer(answer_span(resp[1].get("text", ""))) is not None) / total
+                     if _extract_gsm8k_answer(answer_span(resp.get("text", ""))) is not None) / total
     print(f"questions={n} samples/q={args.samples} mode={'greedy' if args.greedy else 'sample'}")
     print(f"lenient accuracy (per-q mean): {acc:.4f}")
     print(f"strict accuracy: {strict_ok}/{total} = {strict_ok / total:.4f}")
