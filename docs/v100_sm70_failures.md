@@ -61,8 +61,13 @@ With kern's TileLang rmsnorm/fused_add_rmsnorm/silu_and_mul enabled
 * graph captures cleanly on sm70: 12 padded buckets `[1,2,4,8,12,16,24,32,40,
   48,56,64]`, ~24-84 s, ~1.0 GB of the ~3 GB post-KV-pool budget;
 * decode replays the graph (`cuda graph: True` in scheduler logs), greedy
-  output is token-for-token identical to eager, and release/resume
-  (31594 -> 31576 MiB) keeps it correct.
+  output is token-for-token identical to eager.
+
+> **Release/resume numbers previously listed here (31594 -> 31576 MiB) are
+> invalid.** Those check servers were started without `--enable-memory-saver`,
+> so `/release_memory_occupation` was a no-op (HTTP 200 in ~10 ms, ~20 MiB
+> freed) and measured nothing about the graph pool. The valid three-mode
+> comparison (saver on, mem_fraction 0.6) is in the section below.
 
 CUDA graph is the **main decode speedup**, ~8x (kern's same-config eager
 numbers: ~25 tok/s single, ~1436 batch-64; graph: ~208 single, ~3310 batch-64).
@@ -94,11 +99,16 @@ colocate fraction 0.6 with graph + TileLang: decode graph captures **once,
 cleanly** (12 padded buckets, 24.3 s, 0 failure/OOM lines; post-KV-pool
 availability is 12.1 GB — more headroom than the 0.85 run's 3.1 GB, so a
 smaller fraction makes capture easier, not harder). Single 190.9 tok/s,
-batch-64 3920.7 agg tok/s. Release dropped 22362 -> 22342 MiB (at 0.6 the KV
-reservation is already small), and after resume greedy generation was still
-correct (Paris). This is the exact per-colocate-step cycle; no in-process
-capture failure branch or `captures_underway`/empty_cache assertion occurs
-because capture succeeds.
+batch-64 3920.7 agg tok/s. (Capture and speed are unaffected by the
+memory-saver flag and remain valid.)
+
+**Release/resume at 0.6 — rerun pending.** The earlier "22362 -> 22342 MiB,
+Paris OK" claim came from a server without `--enable-memory-saver`; release was
+a no-op there. The corrected three-mode check (graph off / graph on / graph on
++ saver-managed graph pool), all with `--enable-memory-saver
+--mem-fraction-static 0.6`, reports per-group release-stable MiB, release/resume
+latency, post-resume `cuda graph: True`, and Paris correctness. Results land
+here after the on-card run.
 
 ## Native-op profile at Qwen3-0.6B shapes (fp16, N=4096, 200 iters)
 
