@@ -120,8 +120,22 @@ class Topology:
         return [s.endpoint for s in self.inference_services()]
 
     def inference_targets(self) -> list[dict[str, Any]]:
-        """All inference replicas a trainer may push weights to (name+endpoint)."""
-        return [{"name": s.name, "endpoint": s.endpoint} for s in self.inference_services()]
+        """All inference replicas a trainer may push weights to.
+
+        Carries ``hicache_storage_enabled`` from the replica's SGLang
+        server_args so the weight-publish path knows whether it must clear L3
+        (SGLang rejects the clear endpoint with 400 when HiCache is off).
+        """
+        targets = []
+        for s in self.inference_services():
+            server_args = getattr(s, "server_args", None) or {}
+            targets.append({
+                "name": s.name,
+                "endpoint": s.endpoint,
+                "hicache_storage_enabled": bool(
+                    server_args.get("hicache_storage_backend")),
+            })
+        return targets
 
     def trainer_endpoint(self) -> str | None:
         trainers = self.training_services()

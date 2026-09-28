@@ -96,16 +96,13 @@ def _publish_weights_to_inference(
                 f"{endpoint}/update_weights_from_disk",
                 json={"model_path": weights_path},
             ).raise_for_status()
-            # Drop HiCache L3 on the replica: L3 keys are token-only and survive
-            # SGLang's radix flush, so stale old-policy KV would otherwise be read
-            # under the new weights. 404 means the replica has no L3 backend.
-            try:
+            # Drop HiCache L3 only on replicas that actually have one. With L3
+            # off SGLang returns 400, so decide from the target config instead
+            # of probing the endpoint. A real clear failure must surface.
+            if target.get("hicache_storage_enabled"):
                 client.post(
                     f"{endpoint}/clear_hicache_storage_backend", timeout=300.0
                 ).raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 404:
-                    raise
 
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
         futures = [pool.submit(sync_one, target) for target in targets]
