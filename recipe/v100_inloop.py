@@ -31,6 +31,11 @@ SYSTEM_PROMPT = "You are a helpful assistant."
 SUFFIX = ' Let\'s think step by step and output the final answer after "####".'
 
 EVAL_EVERY = int(os.environ.get("XRL_EVAL_EVERY", "50"))
+# First version to evaluate, then every EVAL_EVERY. Needed for warm-started
+# runs whose version N corresponds to cumulative window N+OFFSET (e.g. a run
+# started from old window 3: new version 0 == cumulative window 3, so eval at
+# new versions 3,9,15,... to land on cumulative windows 6,12,18,...).
+EVAL_OFFSET = int(os.environ.get("XRL_EVAL_OFFSET", "0"))
 EVAL_N = int(os.environ.get("XRL_EVAL_N", "200"))
 KEEP_VERSIONS = int(os.environ.get("XRL_KEEP_VERSIONS", "3"))
 MAX_NEW_TOKENS = int(os.environ.get("XRL_EVAL_MAX_NEW", "4096"))
@@ -158,7 +163,7 @@ async def version_hook(*, version: int, engine, model_path: str, **_: object) ->
     """200x1 holdout + milestone copy + old-version prune, once per version."""
     root = _runtime_root()
 
-    if version % EVAL_EVERY == 0:
+    if version >= EVAL_OFFSET and (version - EVAL_OFFSET) % EVAL_EVERY == 0:
         summary = await _holdout_eval(engine, model_path, root, version)
         print(f"[inloop-eval v{version}] {json.dumps(summary)}", flush=True)
         src = os.path.join(_weights_dir(root), f"v{version}")

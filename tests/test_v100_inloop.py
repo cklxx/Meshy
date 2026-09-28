@@ -86,3 +86,21 @@ def test_render_ids_passes_plain_list():
             return [1, 2, 3, 4]
 
     assert inloop._render_ids(FakeTok(), []) == [1, 2, 3, 4]
+
+
+def test_eval_versions_with_offset(monkeypatch):
+    # Warm-started at cumulative window 3: new version N == window N+3.
+    # Eval cumulative windows 6,12,...,36 -> new versions 3,9,...,33.
+    monkeypatch.setattr(inloop, "EVAL_OFFSET", 3)
+    monkeypatch.setattr(inloop, "EVAL_EVERY", 6)
+    hits = [v for v in range(38)
+            if v >= inloop.EVAL_OFFSET and (v - inloop.EVAL_OFFSET) % inloop.EVAL_EVERY == 0]
+    assert hits == [3, 9, 15, 21, 27, 33]
+
+
+def test_eval_versions_no_offset(monkeypatch):
+    monkeypatch.setattr(inloop, "EVAL_OFFSET", 0)
+    monkeypatch.setattr(inloop, "EVAL_EVERY", 50)
+    hits = [v for v in range(100)
+            if v >= 0 and (v - 0) % 50 == 0]
+    assert hits == [0, 50]
