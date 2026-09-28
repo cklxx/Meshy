@@ -288,6 +288,34 @@ class SGLangEngine:
 
     def load_weights(self, model_path: str) -> None:
         self._management("POST", "/update_weights_from_disk", json={"model_path": model_path}, timeout=1800.0)
+        # Weight updates invalidate KV computed under the old policy. SGLang's
+        # flush_cache (on by default) only resets the GPU radix/host pool; it
+        # does NOT touch the L3 storage backend, whose keys are token-only and
+        # carry no weight version. Without this, a same-prompt rollout on the
+        # new weights would read stale L3 KV and silently diverge from the
+        # recorded logprobs. Drop L3 on every weight swap.
+        self.clear_hicache_storage()
+
+    def clear_hicache_storage(self) -> None:
+        """Invalidate the HiCache L3 backend on every rank.
+
+        No-op unless an L3 backend is configured (the endpoint then 404s).
+        """
+        import requests
+
+        for endpoint in self._endpoint_values:
+            try:
+                requests.post(
+                    f"{endpoint}/clear_hicache_storage_backend", timeout=300.0
+                ).raise_for_status()
+                logger.info("SGLang {} cleared HiCache L3 after weight update", endpoint)
+            except requests.RequestException as exc:
+                # 404 = no L3 backend attached; anything else is worth surfacing
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 404:
+                    logger.debug("SGLang {} has no HiCache L3 backend to clear", endpoint)
+                else:
+                    raise
 
     def release_for_colocate(self) -> None:
         self.pause_generation()

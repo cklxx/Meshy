@@ -1,0 +1,28 @@
+# Runtime image for the single-node 3FS cluster.
+# Reuses the builder image so every shared lib (folly, libfuse3, fdb client,
+# ibverbs + rxe provider) matches the toolchain the binaries were built with.
+# Build context is /data00/meshy/fs3 (debs/ holds the downloaded FDB packages).
+FROM 3fs-builder:dev
+
+# FoundationDB server (clients 7.3.63 already present in the base image).
+COPY run/debs/foundationdb-server_7.3.63-1_amd64.deb /tmp/fdb-server.deb
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      fuse3 iproute2 kmod python3 python3-pip sudo jq \
+      libjemalloc2 \
+ # Extract fdb-server without its postinst: it tries to start the service via
+ # init.d/systemd and run fdbcli configure, which fails in a build container.
+ # We launch fdbserver ourselves; only the binary and shared paths are needed.
+ && dpkg-deb -x /tmp/fdb-server.deb / \
+ && test -x /usr/sbin/fdbserver \
+ && rm -f /tmp/fdb-server.deb \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 3FS binaries and stock config templates.
+COPY 3FS/build/bin /opt/3fs/bin
+COPY 3FS/configs /opt/3fs/configs
+COPY 20_start_cluster.sh provision_targets.sh /opt/3fs/lib/
+RUN chmod +x /opt/3fs/lib/*.sh
+
+ENV PATH=/opt/3fs/bin:/root/.cargo/bin:${PATH}
+WORKDIR /opt/3fs

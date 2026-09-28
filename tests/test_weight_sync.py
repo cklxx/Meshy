@@ -22,9 +22,8 @@ def test_publisher_updates_only_inference_outside_colocation_ring(monkeypatch) -
         def raise_for_status(self) -> None:
             return None
 
-    def post(url: str, *, json: dict, timeout: float):
-        calls.append((url, json))
-        assert timeout == 1800.0
+    def post(url: str, *, json: dict | None = None, timeout: float = 0.0):
+        calls.append((url, json, timeout))
         return Response()
 
     monkeypatch.setattr(httpx, "post", post)
@@ -39,12 +38,79 @@ def test_publisher_updates_only_inference_outside_colocation_ring(monkeypatch) -
         managed_names={"actor-infer-0"},
     )
 
-    assert calls == [
+    # Weight push, then mandatory L3 invalidation on the same replica.
+    assert [(u, j) for u, j, _ in calls] == [
         (
             "http://infer:30001/update_weights_from_disk",
             {"model_path": "/runtime/weights/titan/v3"},
-        )
+        ),
+        ("http://infer:30001/clear_hicache_storage_backend", None),
     ]
+    assert calls[0][2] == 1800.0
+
+
+def test_publisher_tolerates_replica_without_hicache_backend(monkeypatch) -> None:
+    import httpx as _httpx
+
+    class Ok:
+        def raise_for_status(self) -> None:
+            return None
+
+    class NotFound(_httpx.HTTPStatusError):
+        def __init__(self) -> None:
+            resp = SimpleNamespace(status_code=404)
+            super().__init__("no backend", request=SimpleNamespace(), response=resp)
+
+    sequence = ["update", "clear"]
+
+    def post(url: str, *, json: dict | None = None, timeout: float = 0.0):
+        stage = sequence.pop(0)
+        if stage == "clear":
+            raise NotFound()
+        return Ok()
+
+    monkeypatch.setattr(httpx, "post", post)
+    # Must not raise: 404 on the clear endpoint just means L3 is disabled.
+    _publish_weights_to_inference(
+        [{"name": "s", "endpoint": "http://infer:30001/"}],
+        "/w/v1", 1, "titan", managed_names=set(),
+    )
+    assert sequence == []
+
+
+def test_load_weights_clears_hicache_l3(monkeypatch) -> None:
+    """A weight swap must invalidate token-keyed L3 KV (regression: stale old-
+    policy KV otherwise survives SGLang's GPU-radix-only flush and is read
+    under the new weights). Fails if the clear endpoint is not called."""
+    import requests
+
+    posted: list[str] = []
+
+    class Resp:
+        def __init__(self, status: int = 200) -> None:
+            self.status_code = status
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError("boom", response=self)
+
+    def fake_request(url: str, **kwargs):
+        posted.append(f"POST {url}")
+        return Resp(200)
+
+    monkeypatch.setattr(requests, "post", fake_request)
+    monkeypatch.setattr(requests, "get", fake_request)
+
+    engine = SGLangEngine(["http://infer:30000"])
+    try:
+        engine.load_weights("/weights/v9")
+    finally:
+        asyncio.run(engine.close())
+
+    assert any(url.endswith("/update_weights_from_disk") for _, url in
+               (p.split(" ", 1) for p in posted))
+    assert any(url.endswith("/clear_hicache_storage_backend") for _, url in
+               (p.split(" ", 1) for p in posted)), posted
 
 
 def test_sglang_colocate_acquire_uses_checkpoint_from_grant() -> None:

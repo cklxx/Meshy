@@ -92,6 +92,14 @@ MODEL_FLAVOR = os.environ.get("XRL_MODEL_FLAVOR", "0.6B")
 SEQ_LEN = int(os.environ.get("XRL_SEQ_LEN", "1280"))
 MAX_NEW_TOKENS = int(os.environ.get("XRL_MAX_NEW_TOKENS", "1024"))
 
+# Shared 3FS root (FUSE-mounted on the V100). Checkpoints/dumps go under
+# ckpt/, the runtime root (weights + rollout trajectories) under rollout/.
+# Set XRL_STORAGE_ROOT to a local path to run without 3FS; per-dir overrides
+# via XRL_CKPT_DIR / XRL_ROLLOUT_DIR take precedence.
+STORAGE_ROOT = os.environ.get("XRL_STORAGE_ROOT", "/3fs/stage/meshy")
+CKPT_DIR = os.environ.get("XRL_CKPT_DIR", os.path.join(STORAGE_ROOT, "ckpt"))
+ROLLOUT_DIR = os.environ.get("XRL_ROLLOUT_DIR", os.path.join(STORAGE_ROOT, "rollout"))
+
 ROLLOUT_BATCH = int(os.environ.get("XRL_ROLLOUT_BATCH", "8"))  # prompts per step
 GROUP_SIZE = int(os.environ.get("XRL_GROUP_SIZE", "8"))  # completions per prompt
 BATCH_SIZE = ROLLOUT_BATCH * GROUP_SIZE  # trainer trigger threshold: 64
@@ -125,7 +133,7 @@ def _trainer_config() -> TrainerConfig:
         tp_degree=1,
         cp_degree=1,
         enable_checkpoint=False,
-        dump_folder="./outputs/grpo_gsm8k_v100",
+        dump_folder=os.path.join(CKPT_DIR, "grpo_gsm8k_v100"),
         compile_model=False,
     )
 
@@ -230,6 +238,9 @@ COLOCATIONS = [
 
 
 def main() -> None:
+    # Point the runtime root (weights + rollout trajectories) at 3FS unless
+    # the caller already pinned XRL_RUNTIME_DIR.
+    os.environ.setdefault("XRL_RUNTIME_DIR", ROLLOUT_DIR)
     Ignitor(SERVICE_GROUPS, COLOCATIONS).run()
 
 

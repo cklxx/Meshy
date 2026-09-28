@@ -1,0 +1,13 @@
+# Keep build context small: runtime image needs build/bin, configs, run/debs.
+3FS/.git
+3FS/build/*
+!3FS/build/bin
+3FS/third_party
+*.log
+run/etc
+run/log
+run/data-s1
+run/data-s2
+run/fdb
+run/gen_configs.py
+mnt
