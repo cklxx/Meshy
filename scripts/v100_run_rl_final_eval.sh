@@ -20,7 +20,7 @@ V="${2:-v300}"
 CKPT="$RUN_DIR/weights/actor_train-0/$V"
 [ -d "$CKPT" ] || { echo "missing $CKPT"; exit 2; }
 
-OUT="$(dirname "$0")/logs/final_eval_$(basename "$RUN_DIR")_${V}_$(date +%s).jsonl"
+OUT="/data00/meshy/rl/logs/final_eval_$(basename "$RUN_DIR")_${V}_$(date +%s).jsonl"
 echo "FINAL_EVAL checkpoint=$CKPT out=$OUT graph=$MESHY_SM70_CUDA_GRAPH"
 START=$(date +%s)
 $PY scripts/eval_gsm8k.py --model "$CKPT" --n 200 --samples 4 \
