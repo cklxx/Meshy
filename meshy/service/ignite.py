@@ -235,15 +235,88 @@ class Ignitor:
         procs = [p for s in self.services for p in s.processes]
         if not procs:
             # Passive / idle ranks (e.g. non-master inference cards, or cards
-            # not used by this pass) keep the torchrun group uniform by idling.
-            logger.info("Rank {} has no local engine process; idling.", os.environ.get("RANK", 0))
-            try:
-                while True:
-                    time.sleep(3600)
-            except KeyboardInterrupt:
-                return
+            # not used by this pass) keep the torchrun group uniform by idling,
+            # but they must still exit fast when a sibling rank fails.
+            from meshy.service.failfast import watch_for_fatal
+
+            cause = watch_for_fatal(lambda: None)
+            if cause is not None:
+                self._fail_fast(cause)
+            return
+
+        from meshy.service.failfast import watch_for_fatal
+
+        # Fails fast on either a run-wide fatal marker or a local engine child
+        # exiting on its own (worker self-terminates via SIGTERM on fatal; any
+        # other unexpected exit must also tear the group down, not hang).
+        def _local_failure() -> str | None:
+            for service in self.services:
+                for p in service.processes:
+                    if not p.is_alive() and (p.exitcode or 0) != 0:
+                        return f"service {service.name!r} process exited with code {p.exitcode}"
+            return None
+
+        cause = watch_for_fatal(_local_failure)
+        if cause is None:
+            for p in procs:
+                p.join()
+            return
+        self._fail_fast(cause)
+
+    def _fail_fast(self, cause: str) -> None:
+        """Terminate every local service and exit non-zero on the first fatal.
+
+        The bootstrap-store fatal marker (already published by the failing
+        worker) makes every other Ignitor rank reach here too, so the whole
+        torchrun group -- and therefore launch.py -- exits within seconds.
+        """
+        logger.error("FATAL: aborting run: {}", cause)
+        # Surface the first cause on the launch stdout for rank 0; other ranks
+        # log to their redirected service logs.
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"[ignitor] FATAL: {cause}", flush=True)
+        for service in self.services:
+            self._hard_terminate_service(service)
+        # Hard exit: normal sys.exit can be swallowed by non-daemonic threads
+        # (engine command loops / TQ clients) that would otherwise keep the
+        # torchrun rank alive -- the exact hang this is fixing.
+        os._exit(1)
+
+    def _hard_terminate_service(self, service) -> None:
+        """SIGKILL every engine/SGLang process group without graceful shutdown.
+
+        On a fail-fast path ``SGLangService.terminate`` could block on its
+        ``asyncio engine.close()`` HTTP call (the server may already be dead),
+        so kill the process groups directly. SGLang children are spawned with
+        ``start_new_session=True`` (their own pgid); spawn-engine children share
+        ours and are reaped individually.
+        """
+        import signal
+
+        procs = [p for s in self.services for p in list(s.processes)]
+        alive = []
         for p in procs:
             try:
-                p.join()
-            except KeyboardInterrupt:
-                break
+                if p.is_alive():
+                    alive.append(p)
+            except ValueError:
+                pass
+
+        def _kill(p) -> None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+        # SGLang servers are spawned with start_new_session (their own pgid);
+        # kill those first so they do not survive as orphans when the engine
+        # children -- which share this ignitor's process group -- kill us too.
+        leaders = [p for p in alive if os.getpgid(p.pid) == p.pid]
+        shared = [p for p in alive if os.getpgid(p.pid) != p.pid]
+        for p in leaders:
+            _kill(p)
+        for p in shared:
+            _kill(p)
