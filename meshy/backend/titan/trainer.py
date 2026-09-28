@@ -228,10 +228,14 @@ class TitanTrainer(ForgeEngine):
             # Micro-batch shapes now vary per step. Dynamo turns the block
             # graphs dynamic after the second distinct shape, but the default
             # cache of 8 entries is too small for the bucketed shape set.
-            import torch._dynamo
+            # ``from torch import _dynamo`` (not ``import torch._dynamo``):
+            # the latter binds ``torch`` as a function-local, shadowing the
+            # module-level import for the whole __init__ and making the earlier
+            # GradScaler construction raise UnboundLocalError.
+            from torch import _dynamo
 
-            torch._dynamo.config.cache_size_limit = max(
-                torch._dynamo.config.cache_size_limit, 64
+            _dynamo.config.cache_size_limit = max(
+                _dynamo.config.cache_size_limit, 64
             )
 
         loaded = self.checkpointer.load(step=self.config.checkpoint.load_step)

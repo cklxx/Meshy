@@ -168,6 +168,101 @@ def _force_native_fused_ops() -> None:
     os.environ.setdefault("SGLANG_FORCE_FUSED_OP_BACKEND", "native")
 
 
+def tilelang_enabled() -> bool:
+    """Whether the TileLang fused-op path is requested (MESHY_SM70_TILELANG=1)."""
+    import os
+
+    return os.environ.get("MESHY_SM70_TILELANG", "0") == "1"
+
+
+def _install_tilelang_fused_ops(*, prewarm: bool = True) -> None:
+    """Redirect RMSNorm / fused_add_rmsnorm / SiLUAndMul to meshy.kernels.
+
+    The sm70 patch forces every BaseFusedOp onto ``KernelBackend.TORCH``, so
+    dispatch calls ``forward_native`` directly — that is the single chokepoint
+    to override (``forward_cuda`` is never reached under the force). We wrap
+    the three classes' ``forward_native``; above the largest compiled row
+    bucket the wrapper falls back to the original native implementation, so
+    a long prefill chunk can never crash serve.
+    """
+    import os
+
+    import torch
+
+    import sglang.srt.layers.layernorm as _ln
+    import sglang.srt.layers.activation as _act
+    from meshy import kernels as _tl
+
+    def _wrap_rmsnorm(cls):
+        orig = cls.forward_native
+
+        def forward_native(self, x, residual=None, post_residual_addition=None):
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            eps = float(self.variance_epsilon)
+            if self.variance_size_override is not None:
+                return orig(self, x, residual, post_residual_addition)
+            # Kernels are fp16-only; rl_on_policy_target uses fp32 weights /
+            # override_orig_dtype and must stay on the native path.
+            if self.weight.data.dtype != torch.float16 or x.dtype != torch.float16:
+                return orig(self, x, residual, post_residual_addition)
+            if residual is None:
+                try:
+                    out = _tl.rmsnorm(x, self.weight.data, eps)
+                except ValueError:
+                    return orig(self, x)
+                if x.dim() != 2:
+                    out = out.reshape(x.shape)
+                return out
+            if residual.dtype != torch.float16:
+                return orig(self, x, residual, post_residual_addition)
+            try:
+                _tl.fused_add_rmsnorm(
+                    x, residual, self.weight.data, eps
+                )
+            except ValueError:
+                return orig(self, x, residual)
+            return x, residual
+
+        cls.forward_native = forward_native  # type: ignore[assignment]
+        return cls
+
+    def _wrap_silu(cls):
+        orig = cls.forward_native
+
+        def forward_native(self, x):
+            try:
+                return _tl.silu_and_mul(x)
+            except ValueError:
+                return orig(self, x)
+
+        cls.forward_native = forward_native  # type: ignore[assignment]
+        return cls
+
+    _wrap_rmsnorm(_ln.RMSNorm)
+    _wrap_silu(_act.SiluAndMul)
+
+    if prewarm:
+        # Qwen3-0.6B: hidden 1024 (RMSNorm) and SwiGLU half-width 3072.
+        # Compiling every row bucket once here means /health_generate never
+        # lets a first request pay JIT latency.
+        norm_widths = [int(v) for v in os.environ.get(
+            "MESHY_SM70_TILELANG_NORM_WIDTHS", "1024"
+        ).split(",") if v]
+        silu_halves = [int(v) for v in os.environ.get(
+            "MESHY_SM70_TILELANG_SILU_HALVES", "3072"
+        ).split(",") if v]
+        compiled = _tl.prewarm(
+            norm_widths=norm_widths, silu_halves=silu_halves
+        )
+        logger.info(
+            "[sglang-sm70] TileLang fused ops installed + prewarmed: "
+            f"{len(compiled)} kernels (norm {norm_widths}, silu {silu_halves})"
+        )
+    else:
+        logger.info("[sglang-sm70] TileLang fused ops installed (prewarm off)")
+
+
 def apply_sm70_patch() -> bool:
     """Apply all sm70 compatibility patches. Returns True if applied."""
     global APPLIED
@@ -182,8 +277,15 @@ def apply_sm70_patch() -> bool:
     _install_common_ops_stub()
     _patch_gate()
     _force_native_fused_ops()
+    if tilelang_enabled():
+        # Prewarm happens here, synchronously, before SGLang imports the
+        # model — keeping first-request latency free of TileLang JIT.
+        _install_tilelang_fused_ops(prewarm=True)
     APPLIED = True
-    logger.info("[sglang-sm70] applied sm70 compatibility patch")
+    logger.info(
+        "[sglang-sm70] applied sm70 compatibility patch "
+        f"(TileLang fused ops: {'on' if tilelang_enabled() else 'off'})"
+    )
     return True
 
 

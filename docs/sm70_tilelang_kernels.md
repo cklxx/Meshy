@@ -52,3 +52,60 @@ def _rms(x, w, eps=1e-6):
 inside a real SGLang generate (env's T1b smoke); the switch is opt-in.
 First call per (M, N) pays JIT compile (~seconds); compiled kernels are
 cached in-process.
+
+## RoPE: estimate only (not implemented, T3c)
+
+env's op profile at N=4096 (Qwen3-0.6B, native fused ops):
+
+| op | share | TileLang speedup (this branch) | post-TL share |
+|---|---|---|---|
+| sdpa_prefill (triton) | 54.9% | — | ~68% |
+| rope | 15.0% | not done | ~18.6% |
+| fused_add_rmsnorm | 10.2% | ~8.7x @2048 | ~1.5% |
+| sdpa_decode (triton) | 7.7% | — | ~9.5% |
+| rmsnorm | 6.5% | ~9.3x @2048 | ~0.9% |
+| silu_and_mul | 5.6% | ~10.4x @2048 | ~0.7% |
+
+After wiring the three norm/activation kernels, total hot-path time drops
+~19% and RoPE becomes the largest non-attention cost at ~18.6%. RoPE is a
+pure elementwise cos/sin rotation on q and k (two reads, two writes plus a
+read-only cache per token, fp32 internally), so a TileLang kernel has the
+same structural speedup source as the norm kernels — removing PyTorch
+multi-kernel dispatch and doing the rotate-half in registers. A realistic
+3-5x would cut the RoPE share to ~4-6% and total hot-path time by another
+~10-12 percentage points.
+
+It is worth doing **after** the e2e numbers confirm the norm kernels help
+in a live server (microbench speedup can be eaten by dispatch/alloc in the
+real call sequence). Implementation is more involved than RMSNorm: q/k are
+3D `[tokens, heads, head_dim]` gathered by position ids, the cos/sin
+cache layout is the interleaved Qwen3 format, and the op is in-place on
+two tensors at once — so it warrants its own correctness comparison
+against `sglang.jit_kernel.rope` before replacing the native path.
+
+## End-to-end serving numbers (measured 2026-09-28, V100, Qwen3-0.6B)
+
+`scripts/sm70_e2e_bench.py`, triton attention, fp16, no CUDA graph,
+warm server (a discarded warmup request precedes each timed run), run
+order native, TileLang, TileLang, native. Raw JSON on the box:
+`/data00/meshy/kern/e2e_bench.json`.
+
+| run | fused ops | single-stream tok/s | batch64 tok/s | output len |
+|---|---|---|---|---|
+| 0 | native | 19.77 | 1143 | 769 |
+| 1 | TileLang | 24.89 | 1426 | 775 |
+| 2 | TileLang | 24.89 → 25.55 | 1426 → 1445 | 775 |
+| 3 | native | 19.81 | 1149 | 769 |
+
+**Single-stream +26-29%, batch64 +25-26%** with the TileLang fused-op
+path; the two repeats of each backend agree with each other. Greedy
+outputs match exactly for the first ~400 characters (including the
+correct final answer "240") and diverge later in the chain-of-thought:
+expected for greedy decoding across two fp16 numerics that differ by
+~1 ULP in the norm layers — the longer the autoregressive chain, the
+more a tiny logit tie-break difference branches. Each backend is itself
+deterministic across its two runs (TileLang/TileLang identical,
+native/native identical), so this is numerics, not nondeterminism.
+
+The TileLang server prewarms 33 kernels at startup (native server: 0
+TileLang compiles), so no first-request JIT.
