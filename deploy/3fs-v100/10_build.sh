@@ -35,10 +35,29 @@ build_runtime() {
   docker build --network=host -f "$ROOT/Dockerfile.runtime" -t 3fs:dev "$ROOT"
 }
 
+# Build the hf3fs_py_usrbio cp312 wheel for SGLang HiCache. The builder image
+# only has python 3.10, so the uv-managed cpython 3.12 (the one the shared
+# venv is built from) is bind-mounted and used to create the build venv.
+# Wheel lands in $REPO/dist/hf3fs_py_usrbio-*.whl.
+build_usrbio() {
+  local uvp=${UVPY_DIR:-/data00/home/chenkailun.c/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu}
+  docker run --rm --network=host \
+    -e HTTP_PROXY=$P -e HTTPS_PROXY=$P -e http_proxy=$P -e https_proxy=$P \
+    -v "$REPO:/3FS" -w /3FS -v "$uvp:$uvp" 3fs-builder:dev bash -c "
+      export PATH=/root/.cargo/bin:\$PATH
+      git config --global --add safe.directory /3FS
+      $uvp/bin/python3.12 -m venv /tmp/bv
+      /tmp/bv/bin/pip install -q -U pip setuptools wheel
+      CMAKE_ARGS=-DSHUFFLE_METHOD=g++11 CMAKE_BUILD_PARALLEL_LEVEL=8 \
+        /tmp/bv/bin/python setup.py bdist_wheel -d /3FS/dist
+    "
+}
+
 case "${1:-}" in
   builder)   build_builder ;;
   compile)   compile ;;
   runtime)   build_runtime ;;
+  usrbio)    build_usrbio ;;
   all)       build_builder && compile && build_runtime ;;
-  *) echo "usage: $0 {builder|compile|runtime|all}" >&2; exit 2 ;;
+  *) echo "usage: $0 {builder|compile|runtime|usrbio|all}" >&2; exit 2 ;;
 esac

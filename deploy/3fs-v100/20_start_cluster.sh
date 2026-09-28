@@ -128,8 +128,14 @@ else
   sleep 3
 fi
 
-# Mount root is root-owned 0755 and 3FS refuses chmod on it; expose one
-# world-writable data dir for host users writing through the FUSE mount.
+# Mount root is root-owned 0755 and 3FS refuses chmod on it. Expose the
+# Meshy job directories owned by the training user (host uid 1001), so the
+# trainer/SGLang can write without root. Set MESHY_UID to override.
+MESHY_UID=${MESHY_UID:-1001}
+MESHY_GID=${MESHY_GID:-1001}
+mkdir -p /3fs/stage/meshy/kvcache /3fs/stage/meshy/ckpt /3fs/stage/meshy/rollout
+chown -R "$MESHY_UID:$MESHY_GID" /3fs/stage/meshy
+# One world-writable scratch dir for non-Meshy smoke tests/host users.
 mkdir -p /3fs/stage/data && chmod 777 /3fs/stage/data
 
 log "nodes:"
