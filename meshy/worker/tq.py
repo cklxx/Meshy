@@ -88,7 +88,7 @@ class TQWorker(Worker):
         retry_interval: float = 1.0,
         paused: threading.Event | None = None,
         client_factory: Callable[[str], Any] | None = None,
-        terminate_process_on_fatal: bool = False,
+        terminate_process_on_fatal: bool = True,
     ) -> None:
         if not hasattr(self, "_worker_stop"):
             Worker.__init__(self)
@@ -162,8 +162,20 @@ class TQWorker(Worker):
     def on_tq_fatal(self, error: BaseException) -> None:
         self._tq_fatal_error = error
         logger.error("{} fatal error: {}", type(self).__name__, error)
-        if self._tq_terminate_process_on_fatal:
-            os.kill(os.getpid(), signal.SIGTERM)
+        if not self._tq_terminate_process_on_fatal:
+            return
+        # Publish the first cause for the whole process group (so sibling
+        # ignitors fail-fast too) before this process exits; the engine child
+        # dying is what the parent Ignitor's fatal watch reacts to.
+        try:
+            from meshy.service.failfast import publish_fatal
+
+            publish_fatal(type(self).__name__, error)
+        except Exception:
+            pass
+        # SIGTERM (not SIGKILL): torch/distributed teardown and the
+        # PR_SET_PDEATHSIG chain get a chance, and the exit is non-zero.
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def run(self) -> None:
         self.run_tq_worker()
