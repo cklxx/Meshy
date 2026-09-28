@@ -21,9 +21,10 @@ site-packages**. It does three things on sm70:
 3. Force every ``BaseFusedOp`` (RMSNorm, fused_add_rmsnorm, SiLUAndMul, RoPE,
    ...) onto ``forward_native`` via SGLang's own global backend switch.
 
-Attention and sampling are selected separately with server flags
-(``--attention-backend torch_native|triton --sampling-backend pytorch``) and
-CUDA graph is disabled; those are CLI choices, not monkeypatches.
+Attention, sampling and CUDA graph are selected with server flags
+(``--attention-backend triton --sampling-backend pytorch``, decode graph on by
+default, see :func:`sm70_server_defaults`); those are CLI choices, not
+monkeypatches.
 
 A native op must never silently run a stubbed kernel. If any code reaches a
 ``torch.ops.sgl_kernel.*`` call, the stub raises a clear error naming the op so
@@ -292,19 +293,43 @@ def apply_sm70_patch() -> bool:
 def sm70_server_defaults() -> dict:
     """SGLang server flags required on sm70 (caller values win).
 
-    Pure-torch fused ops, SDPA attention (triton also selectable), pytorch
-    sampling, eager decode/prefill (sm70 graph capture poisons the allocator).
+    fp16, triton attention (the one backend that does not force-disable CUDA
+    graph), pytorch sampling. CUDA graph is enabled for decode by default up to
+    ``MESHY_SM70_CUDA_GRAPH_MAX_BS`` (64): sm70 capture has to be verified at
+    runtime and prefill graph stays off (variable-shape prefill is where the
+    tileRL capture-poisoning failure occurred). Set MESHY_SM70_CUDA_GRAPH=0 to
+    force eager for A/B timing. Memory saver keeps a host weight backup so
+    release/resume restores real weights.
     """
-    return {
+    import os
+
+    graph_on = os.environ.get("MESHY_SM70_CUDA_GRAPH", "1") != "0"
+    max_bs = int(os.environ.get("MESHY_SM70_CUDA_GRAPH_MAX_BS", "64"))
+    defaults = {
         "dtype": "float16",
-        # triton beats torch_native SDPA on V100: ~20 vs ~16 tok/s single,
-        # ~601 vs ~60 agg tok/s at batch 64 (measured 2026-09-28, Qwen3-0.6B).
+        # triton is both the fastest measured backend and graph-compatible;
+        # torch_native forces graph disabled upstream.
         "attention_backend": "triton",
         "sampling_backend": "pytorch",
-        "cuda_graph_backend_decode": "disabled",
-        "cuda_graph_backend_prefill": "disabled",
         "enable_weights_cpu_backup": True,
     }
+    if graph_on:
+        defaults.update(
+            {
+                "cuda_graph_backend_decode": "full",
+                "cuda_graph_backend_prefill": "disabled",
+                "cuda_graph_max_bs_decode": max_bs,
+                "disable_cuda_graph_padding": True,
+            }
+        )
+    else:
+        defaults.update(
+            {
+                "cuda_graph_backend_decode": "disabled",
+                "cuda_graph_backend_prefill": "disabled",
+            }
+        )
+    return defaults
 
 
 def bootstrap_pythonpath() -> str | None:
