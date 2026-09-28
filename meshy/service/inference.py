@@ -227,7 +227,13 @@ class SGLangService(Service):
         if _sm70_active():
             from meshy.backend.sglang_sm70 import sm70_server_defaults
 
-            for key, value in sm70_server_defaults().items():
+            # An explicit disable_cuda_graph (production recipe) must select the
+            # graph-off defaults, or setdefault would also add backend=full and
+            # pass conflicting flags.
+            sm70_defaults = sm70_server_defaults(
+                cuda_graph=False if args.get("disable_cuda_graph") else None
+            )
+            for key, value in sm70_defaults.items():
                 args.setdefault(key, value)
         args.update({"host": self.bind_host, "port": self.endpoint_port, "tp_size": len(self.replica_gpus)})
         if len(by_node) > 1:
