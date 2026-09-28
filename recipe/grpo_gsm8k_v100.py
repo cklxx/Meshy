@@ -175,8 +175,21 @@ def _trainer_config() -> TrainerConfig:
         dp_replicate_degree=1,
         tp_degree=1,
         cp_degree=1,
-        enable_checkpoint=False,
-        dump_folder=os.path.join(CKPT_DIR, "grpo_gsm8k_v100"),
+        enable_checkpoint=os.environ.get("XRL_ENABLE_DCP_CKPT", "1") == "1",
+        checkpoint_interval=int(os.environ.get("XRL_DCP_CKPT_INTERVAL", "10")),
+        checkpoint_keep=int(os.environ.get("XRL_DCP_CKPT_KEEP", "2")),
+        # Per-run DCP resume directory: <ckpt>/grpo_gsm8k_v100/<run>/checkpoint.
+        # XRL_RUN_TAG wins; otherwise reuse the rollout runtime's run name so
+        # a restarted run resumes from its own latest step-N.
+        dump_folder=os.path.join(
+            CKPT_DIR,
+            "grpo_gsm8k_v100",
+            os.environ.get(
+                "XRL_RUN_TAG",
+                os.path.basename(os.environ.get("XRL_RUNTIME_DIR", "").rstrip("/"))
+                or "default",
+            ),
+        ),
         compile_model=False,
         # At ~4-5k-token sequences "selective" (per-op) AC still retains every
         # layer's QKV/attention-score activations: the fp32 attention scores

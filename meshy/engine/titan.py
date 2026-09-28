@@ -196,6 +196,11 @@ class TitanEngine(SpmdEngine):
         mesh = self.trainer.parallel_dims.get_optional_mesh("batch")
         dp_size = mesh.size() if mesh is not None else 1
         self.train_chunk_size = self.trainer.mini_batch_size * dp_size
+        # Resume: DCP load restored trainer.step; align the published weight
+        # version so the next export and inference gate continue the sequence.
+        if self.trainer.step > 0:
+            self.step_index = int(self.trainer.step)
+            self.weight_version = int(self.trainer.step)
         if self.batch_size is not None and self.batch_size % dp_size != 0:
             raise ValueError(
                 f"batch_size ({self.batch_size}) must be divisible by DP size ({dp_size})"
@@ -296,6 +301,12 @@ class TitanEngine(SpmdEngine):
                 )
         self.step_index = new_step
         self.weight_version = new_step
+
+        # DCP resume checkpoint (model + optimizer + LR scheduler + step +
+        # GradScaler). Interval- and last-step-gated inside the checkpointer;
+        # collective, runs on every rank while the model is still on GPU.
+        total = int(getattr(self.trainer.config.training, "steps", 0) or 0)
+        self.trainer.save_checkpoint(last_step=(total > 0 and new_step >= total))
 
         result = StepResult(
             metrics=dict(metrics) if isinstance(metrics, dict) else {"value": metrics},

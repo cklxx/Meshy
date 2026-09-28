@@ -69,6 +69,11 @@ class TrainerConfig:
     cp_degree: int = 1
     enable_checkpoint: bool = False
     checkpoint_folder: str = "checkpoint"
+    #: DCP save period in optimizer steps (model + optimizer + LR scheduler +
+    #: train state). The final step is always saved.
+    checkpoint_interval: int = 10
+    #: DCP snapshots to retain. torchtitan requires >=2 when non-zero.
+    checkpoint_keep: int = 2
     dump_folder: str = "./outputs"
     compile_model: bool = False
     compile_backend: str = "inductor"
@@ -111,6 +116,14 @@ class TrainerConfig:
             )
         if not (0.0 <= self.lr_min_factor <= 1.0):
             raise ValueError(f"lr_min_factor must be within [0, 1], got {self.lr_min_factor!r}")
+        if self.enable_checkpoint and self.checkpoint_interval < 1:
+            raise ValueError(
+                "checkpoint_interval must be >= 1 when checkpoint is enabled, "
+                f"got {self.checkpoint_interval!r}"
+            )
+        if self.checkpoint_keep == 1:
+            # torchtitan rejects 1: the in-flight save needs two replicas.
+            raise ValueError("checkpoint_keep must be 0 (keep all) or >= 2")
 
 
 @dataclass
