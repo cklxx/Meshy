@@ -17,6 +17,10 @@ PY=/data00/meshy/venv/bin/python
 export PYTHONPATH=/data00/meshy/rl/meshy
 
 export XRL_STEPS=300
+# One TQ storage unit, not the spec default 2: single card, single data
+# partition. Each unit held ~1.6 GiB RSS in smoke; host only had 3/31 GiB
+# free, so this is the largest safe reclaim (~1.6 GiB).
+export XRL_TQ_STORAGE_UNITS=1
 export XRL_RUNTIME_DIR=/3fs/stage/meshy/rollout/rl-formal-$(date +%Y%m%d-%H%M%S)
 echo "RUNTIME=$XRL_RUNTIME_DIR"
 echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || cat /data00/meshy/rl/COMMIT)"
