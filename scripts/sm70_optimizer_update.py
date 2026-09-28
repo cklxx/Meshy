@@ -1,134 +1,296 @@
 """Measure how many parameters one AdamW step actually moves at lr=1e-6.
 
-Motivation: uniform-fp16 storage stores parameters *and* Adam moments in
-fp16. At |w| ~= 0.02 the fp16 ULP is ~1.5e-5, so an lr=1e-6 AdamW update
-(~1e-6) is smaller than half an ULP and rounds away; small fp16 gradients
-can underflow as well. This script quantifies both effects on real
-torchtitan Qwen3 weights, two arms:
+Uniform-fp16 storage stores parameters and Adam moments in fp16: at |w| ~=
+0.02 the fp16 ULP is ~1.5e-5, so an lr=1e-6 AdamW update (~1e-6) is below
+half a ULP and rounds away. This script runs two arms on one GPU:
 
-* ``fp16``  : parameters fp16, plain fp16 fwd/bwd (the old v100 default);
-* ``fp32``  : fp32 master parameters, fwd/bwd under ``autocast(fp16)`` with
-              a dynamic GradScaler (the mixed-precision path, new default).
+* ``fp16``        : parameters fp16, native fp16 fwd/bwd (old v100 default);
+* ``fp32+fsdp16`` : fp32 master parameters with the real production
+                    parallelize path (``parallelize_qwen3``) under a
+                    world-size-1 FSDP mesh with MixedPrecisionPolicy
+                    param_dtype=fp16 + dynamic GradScaler. This verifies
+                    FSDP mixed precision applies at degree 1 and records
+                    the dtype the first block actually sees in forward.
 
-Single GPU, no distributed init. Prints and writes JSON::
+Single process, no torchrun. Prints and writes JSON::
 
-    python scripts/sm70_optimizer_update.py --flavor 0.6B --out /data00/meshy/kern/ulp.json
+    python scripts/sm70_optimizer_update.py --flavor 0.6B --out ulp.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import torch
+import torch.distributed as dist
 
+from torchtitan.config.configs import (
+    ActivationCheckpointConfig,
+    CommConfig,
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
+from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.models.qwen3 import model_registry
 from torchtitan.tools import utils as tools_utils
 
+MANTISSA = {torch.float16: 10, torch.float32: 23}
 
-def run_arm(dtype: torch.dtype, *, mixed_fp16: bool, flavor: str) -> dict:
+
+def build_raw(storage: torch.dtype, flavor: str):
     torch.manual_seed(0)
     spec = model_registry(flavor, attn_backend="sdpa")
-    with torch.device("meta"), tools_utils.set_default_dtype(dtype):
+    with torch.device("meta"), tools_utils.set_default_dtype(storage):
         model = spec.model.build()
-    device = torch.device("cuda:0")
-    model.to_empty(device=device)
+    model.to_empty(device="cuda:0")
     with torch.no_grad():
         model.init_states()
     model.train()
+    return model, spec
 
-    # Same optimiser settings as recipe/grpo_gsm8k_v100.py.
-    optimizer = torch.optim.AdamW(
+
+def build_fsdp_fp16_compute(flavor: str, seq_len: int):
+    """Production path: fp32 storage, FSDP degree-1 all-gather cast to fp16."""
+    torch.manual_seed(0)
+    spec = model_registry(flavor, attn_backend="sdpa")
+    cfg = spec.model
+    cfg.update_from_config(
+        trainer_config=type(
+            "TC",
+            (),
+            {
+                "parallelism": ParallelismConfig(),
+                "training": TrainingConfig(seq_len=seq_len),
+                "debug": None,
+            },
+        )()
+    )
+    with torch.device("meta"), tools_utils.set_default_dtype(torch.float32):
+        model = cfg.build()
+
+    parallel_dims = ParallelDims.from_config(ParallelismConfig(), 1)
+    training = TrainingConfig(
+        seq_len=seq_len, dtype="float32", mixed_precision_param="float16"
+    )
+    model = spec.parallelize_fn(
+        model,
+        parallel_dims=parallel_dims,
+        training=training,
+        parallelism=ParallelismConfig(),
+        compile_config=CompileConfig(enable=False, components=[]),
+        ac_config=ActivationCheckpointConfig(mode="none"),
+        dump_folder="/tmp/sm70_ulp_ckpt",
+    )
+    model.to_empty(device="cuda:0")
+    with torch.no_grad():
+        model.init_states()
+    model.train()
+    return model, spec
+
+
+def measure(model, before):
+    total = changed = finite = 0
+    ratios = []
+    for n, p in model.named_parameters():
+        if n not in before:
+            # FSDP flattens names; match by shard order is impossible, so the
+            # FSDP arm is measured before FSDP wrapping callers pass tensors.
+            continue
+        b = before[n].float()
+        v = p.detach().float()
+        ok = torch.isfinite(v)
+        delta = v - b
+        moved = (delta != 0) & ok
+        total += delta.numel()
+        changed += int(moved.sum().item())
+        finite += int(ok.sum().item())
+        bits = 23 if b.dtype == torch.float32 else 10
+        ulp = torch.where(
+            b != 0,
+            2.0 ** (torch.floor(b.abs().clamp_min(2.0 ** -30).log2()) - bits),
+            torch.full_like(b, 2.0 ** (-30 - bits)),
+        )
+        ratios.append(((delta.abs() / ulp) * ok).cpu().reshape(-1))
+    r = torch.cat(ratios) if ratios else torch.empty(0)
+    nz = r[r > 0]
+    return {
+        "params_total": total,
+        "params_changed_finite": changed,
+        "changed_finite_fraction": changed / max(1, total),
+        "param_finite_fraction": finite / max(1, total),
+        "delta_over_ulp_median_of_changed": float(nz.median()) if nz.numel() else 0.0,
+    }
+
+
+def measure_flat(model, before_flat):
+    """FSDP arm: compare each flat sharded param by position."""
+    total = changed = finite = 0
+    ratios = []
+    for n, p in model.named_parameters():
+        b = before_flat[n]
+        if tuple(b.shape) != tuple(p.shape):
+            continue
+        bf = b.float()
+        v = p.detach().float()
+        ok = torch.isfinite(v)
+        delta = v - bf
+        moved = (delta != 0) & ok
+        total += delta.numel()
+        changed += int(moved.sum().item())
+        finite += int(ok.sum().item())
+        ulp = torch.where(
+            bf != 0,
+            2.0 ** (torch.floor(bf.abs().clamp_min(2.0 ** -30).log2()) - 23),
+            torch.full_like(bf, 2.0 ** -53),
+        )
+        ratios.append(((delta.abs() / ulp) * ok).cpu().reshape(-1))
+    r = torch.cat(ratios)
+    nz = r[r > 0]
+    return {
+        "params_total": total,
+        "params_changed_finite": changed,
+        "changed_finite_fraction": changed / max(1, total),
+        "param_finite_fraction": finite / max(1, total),
+        "delta_over_ulp_median_of_changed": float(nz.median()) if nz.numel() else 0.0,
+    }
+
+
+def run_raw_fp16(flavor: str, seq: int):
+    model, spec = build_raw(torch.float16, flavor)
+    opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=1e-6, weight_decay=0.1, betas=(0.9, 0.999), eps=1e-8,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=mixed_fp16)
-
+    ids = torch.randint(0, spec.model.vocab_size, (1, seq), device="cuda:0")
+    tgt = torch.randint(0, spec.model.vocab_size, (1, seq), device="cuda:0")
     before = {n: p.detach().clone() for n, p in model.named_parameters()}
-    input_ids = torch.randint(0, spec.model.vocab_size, (1, 256), device=device)
-    labels = torch.randint(0, spec.model.vocab_size, (1, 256), device=device)
+    opt.zero_grad()
+    z = model(ids)
+    loss = torch.nn.functional.cross_entropy(
+        z.reshape(-1, z.size(-1)).float(), tgt.reshape(-1)
+    )
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    out = measure(model, before)
+    seen = {}
 
-    optimizer.zero_grad()
-    if mixed_fp16:
+    def hook(_m, args):
+        seen.setdefault("qkv_input_dtype", str(args[0].dtype).replace("torch.", ""))
+
+    model.layers["0"].attention.qkv_linear.register_forward_pre_hook(hook)
+    with torch.no_grad():
+        model(ids)
+    out.update(
+        storage_dtype="float16",
+        compute="native fp16, no scaler",
+        skipped_overflow_steps=0,
+        grad_scale=1.0,
+        forward_dtype=seen.get("qkv_input_dtype", "?"),
+        loss=float(loss.detach().float().item()),
+    )
+    del model, opt
+    torch.cuda.empty_cache()
+    return out
+
+
+def run_fsdp_fp32_fp16(flavor: str, seq: int):
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29571")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", rank=0, world_size=1)
+    torch.cuda.set_device(0)
+
+    model, spec = build_fsdp_fp16_compute(flavor, seq)
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=1e-6, weight_decay=0.1, betas=(0.9, 0.999), eps=1e-8,
+    )
+    scaler = torch.cuda.amp.GradScaler(init_scale=128.0, growth_interval=100)
+    ids = torch.randint(0, spec.model.vocab_size, (1, seq), device="cuda:0")
+    tgt = torch.randint(0, spec.model.vocab_size, (1, seq), device="cuda:0")
+
+    seen = {}
+
+    def hook(m, args):
+        seen.setdefault("qkv_input_dtype", str(args[0].dtype).replace("torch.", ""))
+        w = next(
+            (sm.weight for sm in m.modules() if hasattr(sm, "weight") and sm.weight is not None),
+            None,
+        )
+        if w is not None:
+            seen.setdefault("qkv_weight_dtype", str(w.dtype).replace("torch.", ""))
+
+    model.layers["0"].attention.qkv_linear.register_forward_pre_hook(hook)
+
+    skipped = 0
+    before_flat = None
+    for _ in range(8):
+        before_flat = {n: p.detach().clone() for n, p in model.named_parameters()}
+        opt.zero_grad()
         with torch.autocast(device_type="cuda", dtype=torch.float16):
-            logits = model(input_ids)
+            z = model(ids)
             loss = torch.nn.functional.cross_entropy(
-                logits.float().reshape(-1, logits.size(-1)), labels.reshape(-1)
+                z.float().reshape(-1, z.size(-1)), tgt.reshape(-1)
             )
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
+        old = float(scaler.get_scale())
+        scaler.step(opt)
         scaler.update()
-    else:
-        logits = model(input_ids)
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, logits.size(-1)).float(), labels.reshape(-1)
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-    total = changed = 0
-    finite_grads = total_grads = 0
-    delta_over_ulp_vals: list[torch.Tensor] = []
-    mantissa_bits = {torch.float16: 10, torch.float32: 23}[dtype]
-    for n, p in model.named_parameters():
-        b = before[n]
-        delta = (p.detach() - b).float()
-        nz = delta != 0
-        total += delta.numel()
-        changed += int(nz.sum().item())
-        if p.grad is not None:
-            total_grads += p.grad.numel()
-            finite_grads += int(torch.isfinite(p.grad).sum().item())
-        # Per-element ULP of the storage dtype at |b|: 2^(floor(log2|b|) - m).
-        with torch.no_grad():
-            ulp = torch.where(
-                b.float() != 0,
-                2.0 ** (torch.floor(torch.log2(b.float().abs().clamp_min(2.0 ** -30))) - mantissa_bits),
-                torch.full_like(b.float(), 2.0 ** (-30 - mantissa_bits)),
-            )
-            delta_over_ulp_vals.append((delta.abs() / ulp).cpu())
+        if float(scaler.get_scale()) >= old:
+            break
+        skipped += 1
 
-    ratio = torch.cat([v.reshape(-1) for v in delta_over_ulp_vals])
-    result = {
-        "storage_dtype": "float32" if dtype is torch.float32 else "float16",
-        "compute": "fp16-autocast+scaler" if mixed_fp16 else "native storage dtype",
-        "loss_finite": bool(torch.isfinite(loss).item()),
-        "loss": float(loss.detach().float().item()),
-        "params_total": total,
-        "params_changed": changed,
-        "changed_fraction": changed / max(1, total),
-        "grad_finite_fraction": finite_grads / max(1, total_grads),
-        "delta_over_ulp_median": float(ratio.median().item()),
-        "delta_over_ulp_p90": float(torch.quantile(ratio, 0.9).item()),
-        "grad_scale": float(scaler.get_scale()),
-    }
-    del model, optimizer, before
-    torch.cuda.empty_cache()
-    return result
+    # Probe again after training: storage dtype outside forward vs the dtype
+    # the leaf matmul sees while the FSDP unit is unsharded.
+    seen.clear()
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        model(ids)
+    storage = {str(p.dtype).replace("torch.", "") for p in model.parameters()}
+    out = measure_flat(model, before_flat)
+    out.update(
+        storage_dtype="float32",
+        storage_dtypes_seen=sorted(storage),
+        compute="FSDP1 mp.param=fp16, autocast fp16 + GradScaler",
+        skipped_overflow_steps=skipped,
+        grad_scale=float(scaler.get_scale()),
+        forward_input_dtype=seen.get("qkv_input_dtype", "?"),
+        forward_weight_dtype=seen.get("qkv_weight_dtype", "?"),
+        loss=float(loss.detach().float().item()),
+    )
+    return out
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--flavor", default="0.6B")
-    parser.add_argument("--out", default=None)
-    args = parser.parse_args()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--flavor", default="0.6B")
+    ap.add_argument("--seq", type=int, default=256)
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
 
-    assert torch.cuda.is_available(), "this measurement needs the V100"
+    assert torch.cuda.is_available(), "needs a CUDA GPU"
     cap = torch.cuda.get_device_capability()
     report = {
         "device": torch.cuda.get_device_name(0),
         "compute_capability": f"{cap[0]}.{cap[1]}",
         "torch": torch.__version__,
+        "lr": 1e-6,
         "arms": [
-            run_arm(torch.float16, mixed_fp16=False, flavor=args.flavor),
-            run_arm(torch.float32, mixed_fp16=True, flavor=args.flavor),
+            run_raw_fp16(args.flavor, args.seq),
+            run_fsdp_fp32_fp16(args.flavor, args.seq),
         ],
     }
     print(json.dumps(report, indent=2))
     for arm in report["arms"]:
-        assert 0.0 <= arm["changed_fraction"] <= 1.0
+        assert 0.0 <= arm["changed_finite_fraction"] <= 1.0
     if args.out:
         with open(args.out, "w") as f:
             json.dump(report, f, indent=2)
