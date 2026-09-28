@@ -22,12 +22,22 @@ def test_publisher_updates_only_inference_outside_colocation_ring(monkeypatch) -
         def raise_for_status(self) -> None:
             return None
 
-    def post(url: str, *, json: dict, timeout: float):
-        calls.append((url, json))
-        assert timeout == 1800.0
-        return Response()
+    class FakeClient:
+        def __init__(self, **kwargs):
+            # trust_env must be disabled so httpx ignores the broken IPv6 NO_PROXY
+            assert kwargs.get("trust_env") is False
 
-    monkeypatch.setattr(httpx, "post", post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url: str, *, json: dict):
+            calls.append((url, json))
+            return Response()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
     _publish_weights_to_inference(
         [
             {"name": "actor-infer-0", "endpoint": "http://infer:30000"},
@@ -45,6 +55,51 @@ def test_publisher_updates_only_inference_outside_colocation_ring(monkeypatch) -
             {"model_path": "/runtime/weights/titan/v3"},
         )
     ]
+
+
+def test_sglang_engine_tolerates_ipv6_no_proxy(monkeypatch) -> None:
+    # The V100 login environment puts bare ::1 and IPv6 CIDRs (fe80::/10) in
+    # NO_PROXY, which httpx 0.28 cannot parse (InvalidURL: Invalid port ':').
+    # Local/in-cluster clients must build anyway.
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(var, "localhost,127.0.0.1,::1,fe80::/10,fd00::/8")
+    engine = SGLangEngine(["http://127.0.0.1:30000"])
+    try:
+        assert engine.client.is_closed is False
+    finally:
+        asyncio.run(engine.close())
+
+
+def test_publisher_tolerates_ipv6_no_proxy(monkeypatch) -> None:
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(var, "localhost,127.0.0.1,::1,fe80::/10,fd00::/8")
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs.get("trust_env") is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, *, json):
+            return Response()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    # must not raise on the unparseable NO_PROXY
+    _publish_weights_to_inference(
+        [{"name": "infer-0", "endpoint": "http://127.0.0.1:30001/"}],
+        "/w/v1",
+        1,
+        "titan",
+        managed_names=set(),
+    )
 
 
 def test_sglang_colocate_acquire_uses_checkpoint_from_grant() -> None:

@@ -89,12 +89,14 @@ def _publish_weights_to_inference(
 
     def sync_one(target: dict[str, Any]) -> None:
         endpoint = str(target["endpoint"]).rstrip("/")
-        response = httpx.post(
-            f"{endpoint}/update_weights_from_disk",
-            json={"model_path": weights_path},
-            timeout=1800.0,
-        )
-        response.raise_for_status()
+        # In-cluster endpoint: no proxy, and trust_env=False also dodges httpx
+        # failing on IPv6 CIDRs in NO_PROXY (::1, fe80::/10).
+        with httpx.Client(timeout=1800.0, trust_env=False) as client:
+            response = client.post(
+                f"{endpoint}/update_weights_from_disk",
+                json={"model_path": weights_path},
+            )
+            response.raise_for_status()
 
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
         futures = [pool.submit(sync_one, target) for target in targets]
