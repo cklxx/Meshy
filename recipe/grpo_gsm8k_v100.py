@@ -178,6 +178,13 @@ def _trainer_config() -> TrainerConfig:
         enable_checkpoint=False,
         dump_folder=os.path.join(CKPT_DIR, "grpo_gsm8k_v100"),
         compile_model=False,
+        # At ~4-5k-token sequences "selective" (per-op) AC still retains every
+        # layer's QKV/attention-score activations: the fp32 attention scores
+        # alone (16 heads x S^2 x 4 B) are ~1.6 GiB at S=4937 per layer, and
+        # 28 resident layers OOM the V100. "full" wraps each transformer
+        # block; backward recomputes one block at a time (measured decision
+        # for long-context recipes, see TrainerConfig docstring).
+        activation_checkpoint_mode="full",
     )
 
 
