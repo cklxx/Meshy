@@ -82,3 +82,30 @@ real call sequence). Implementation is more involved than RMSNorm: q/k are
 cache layout is the interleaved Qwen3 format, and the op is in-place on
 two tensors at once — so it warrants its own correctness comparison
 against `sglang.jit_kernel.rope` before replacing the native path.
+
+## End-to-end serving numbers (measured 2026-09-28, V100, Qwen3-0.6B)
+
+`scripts/sm70_e2e_bench.py`, triton attention, fp16, no CUDA graph,
+warm server (a discarded warmup request precedes each timed run), run
+order native, TileLang, TileLang, native. Raw JSON on the box:
+`/data00/meshy/kern/e2e_bench.json`.
+
+| run | fused ops | single-stream tok/s | batch64 tok/s | output len |
+|---|---|---|---|---|
+| 0 | native | 19.77 | 1143 | 769 |
+| 1 | TileLang | 24.89 | 1426 | 775 |
+| 2 | TileLang | 24.89 → 25.55 | 1426 → 1445 | 775 |
+| 3 | native | 19.81 | 1149 | 769 |
+
+**Single-stream +26-29%, batch64 +25-26%** with the TileLang fused-op
+path; the two repeats of each backend agree with each other. Greedy
+outputs match exactly for the first ~400 characters (including the
+correct final answer "240") and diverge later in the chain-of-thought:
+expected for greedy decoding across two fp16 numerics that differ by
+~1 ULP in the norm layers — the longer the autoregressive chain, the
+more a tiny logit tie-break difference branches. Each backend is itself
+deterministic across its two runs (TileLang/TileLang identical,
+native/native identical), so this is numerics, not nondeterminism.
+
+The TileLang server prewarms 33 kernels at startup (native server: 0
+TileLang compiles), so no first-request JIT.

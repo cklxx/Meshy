@@ -82,7 +82,13 @@ def start_server(model: str, port: int, tilelang: str, log: str):
     ]
     defaults = sm70_server_defaults()
     for key, value in defaults.items():
-        args += ["--" + key.replace("_", "-"), str(value).lower()]
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            # store_true flags take no value; skip when False.
+            if value:
+                args.append(flag)
+        else:
+            args += [flag, str(value)]
     lf = open(log, "ab", buffering=0)
     proc = subprocess.Popen(args, env=env, stdout=lf, stderr=subprocess.STDOUT,
                             start_new_session=True)
@@ -120,11 +126,11 @@ def timed_decode(port: int, n: int):
     t0 = time.perf_counter()
     outs = generate(port, n)
     dt = time.perf_counter() - t0
-    toks = sum(
-        len(o.get("meta_info", {}).get("completion_tokens", []))
-        or o.get("meta_info", {}).get("completion_tokens", 0)
-        for o in outs
-    )
+    def _count(o):
+        ct = o.get("meta_info", {}).get("completion_tokens", 0)
+        return len(ct) if isinstance(ct, (list, tuple)) else int(ct or 0)
+
+    toks = sum(_count(o) for o in outs)
     return {
         "requests": n,
         "wall_s": round(dt, 3),
