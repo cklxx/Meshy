@@ -40,6 +40,10 @@ from torchtitan.tools import utils as tools_utils
 MANTISSA = {torch.float16: 10, torch.float32: 23}
 
 
+def loc(t):
+    return t.to_local() if hasattr(t, "to_local") else t
+
+
 def build_raw(storage: torch.dtype, flavor: str):
     torch.manual_seed(0)
     spec = model_registry(flavor, attn_backend="sdpa")
@@ -92,22 +96,23 @@ def build_fsdp_fp16_compute(flavor: str, seq_len: int):
 
 
 def measure(model, before):
+    """Compare sharded params in place; works for plain tensors and DTensors."""
     total = changed = finite = 0
     ratios = []
     for n, p in model.named_parameters():
         if n not in before:
-            # FSDP flattens names; match by shard order is impossible, so the
-            # FSDP arm is measured before FSDP wrapping callers pass tensors.
             continue
-        b = before[n].float()
-        v = p.detach().float()
+        b = loc(before[n]).float()
+        v = loc(p).detach().float()
+        if tuple(b.shape) != tuple(v.shape):
+            continue
         ok = torch.isfinite(v)
         delta = v - b
         moved = (delta != 0) & ok
         total += delta.numel()
         changed += int(moved.sum().item())
         finite += int(ok.sum().item())
-        bits = 23 if b.dtype == torch.float32 else 10
+        bits = MANTISSA[loc(before[n]).dtype]
         ulp = torch.where(
             b != 0,
             2.0 ** (torch.floor(b.abs().clamp_min(2.0 ** -30).log2()) - bits),
@@ -115,39 +120,6 @@ def measure(model, before):
         )
         ratios.append(((delta.abs() / ulp) * ok).cpu().reshape(-1))
     r = torch.cat(ratios) if ratios else torch.empty(0)
-    nz = r[r > 0]
-    return {
-        "params_total": total,
-        "params_changed_finite": changed,
-        "changed_finite_fraction": changed / max(1, total),
-        "param_finite_fraction": finite / max(1, total),
-        "delta_over_ulp_median_of_changed": float(nz.median()) if nz.numel() else 0.0,
-    }
-
-
-def measure_flat(model, before_flat):
-    """FSDP arm: compare each flat sharded param by position."""
-    total = changed = finite = 0
-    ratios = []
-    for n, p in model.named_parameters():
-        b = before_flat[n]
-        if tuple(b.shape) != tuple(p.shape):
-            continue
-        bf = b.float()
-        v = p.detach().float()
-        ok = torch.isfinite(v)
-        delta = v - bf
-        moved = (delta != 0) & ok
-        total += delta.numel()
-        changed += int(moved.sum().item())
-        finite += int(ok.sum().item())
-        ulp = torch.where(
-            bf != 0,
-            2.0 ** (torch.floor(bf.abs().clamp_min(2.0 ** -30).log2()) - 23),
-            torch.full_like(bf, 2.0 ** -53),
-        )
-        ratios.append(((delta.abs() / ulp) * ok).cpu().reshape(-1))
-    r = torch.cat(ratios)
     nz = r[r > 0]
     return {
         "params_total": total,
@@ -254,11 +226,11 @@ def run_fsdp_fp32_fp16(flavor: str, seq: int):
     with torch.no_grad():
         model(ids)
     storage = {str(p.dtype).replace("torch.", "") for p in model.parameters()}
-    out = measure_flat(model, before_flat)
+    out = measure(model, before_flat)
     out.update(
         storage_dtype="float32",
         storage_dtypes_seen=sorted(storage),
-        compute="FSDP1 mp.param=fp16, autocast fp16 + GradScaler",
+        compute="FSDP1 mp.param=fp16, no autocast, GradScaler",
         skipped_overflow_steps=skipped,
         grad_scale=float(scaler.get_scale()),
         forward_input_dtype=seen.get("qkv_input_dtype", "?"),
@@ -282,17 +254,18 @@ def main():
         "compute_capability": f"{cap[0]}.{cap[1]}",
         "torch": torch.__version__,
         "lr": 1e-6,
-        "arms": [
-            run_raw_fp16(args.flavor, args.seq),
-            run_fsdp_fp32_fp16(args.flavor, args.seq),
-        ],
+        "arms": [],
     }
-    print(json.dumps(report, indent=2))
+    for run in (lambda: run_raw_fp16(args.flavor, args.seq),
+                lambda: run_fsdp_fp32_fp16(args.flavor, args.seq)):
+        arm = run()
+        report["arms"].append(arm)
+        print(json.dumps(arm), flush=True)
+        if args.out:
+            with open(args.out, "w") as f:
+                json.dump(report, f, indent=2)
     for arm in report["arms"]:
         assert 0.0 <= arm["changed_finite_fraction"] <= 1.0
-    if args.out:
-        with open(args.out, "w") as f:
-            json.dump(report, f, indent=2)
 
 
 if __name__ == "__main__":

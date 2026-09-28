@@ -38,10 +38,11 @@ bypass it.
 Uniform-fp16 storage (`dtype="float16"`) is unsound at this recipe's
 lr. At |w| ≈ 0.02 the fp16 ULP is ≈ 1.5e-5; an AdamW step at lr=1e-6
 (weight_decay=0.1 adds ≈ 2e-9) is below half a ULP and rounds away. Adam
-moments in fp16 additionally lose small gradients. The bf16 default is
-worse on paper (ULP ≈ 1.2e-4 at the same |w|) and cannot run on sm70 at
-all. On-device confirmation: `scripts/sm70_optimizer_update.py` (see
-"Pending verification" below).
+moments in fp16 additionally lose small gradients. Measured on the V100
+(see below) the failure is even sharper: without loss scaling the first
+fp16 backward overflows at the CE layer and the step leaves ~100% of
+params NaN/Inf. The bf16 default is worse on paper (ULP ≈ 1.2e-4 at the
+same |w|) and cannot run on sm70 at all.
 
 ## Findings — Meshy + torchtitan
 
@@ -187,21 +188,38 @@ No sm70 capability gating exists anywhere; arch gates start at sm80/sm90.
 - `scripts/sm70_optimizer_update.py`: one-step AdamW movement test,
   fp16-uniform vs fp32-master/fp16-compute arms.
 
-## Pending on-device verification (blocked on env's T1 venv)
+## On-device verification — DONE (2026-09-28, V100, torch 2.13.0+cu126, sm_70)
 
-Run after `/data00/meshy/venv` has torch (sm70 arch list) + torchtitan:
+`scripts/sm70_optimizer_update.py`, Qwen3-0.6B (596,049,920 params), one
+AdamW step at lr=1e-6, weight_decay 0.1, grad clip 1.0, seq 256. Raw JSON
+on the box: `/data00/meshy/kern/ulp.json`.
 
-```
-awb hold v100gpu kern "optimizer ULP measurement"
-ssh v100 'cd /data00/meshy/kern/Meshy && PATH=/usr/local/cuda-12.4/bin:$PATH \
-  /data00/meshy/venv/bin/python scripts/sm70_optimizer_update.py \
-  --flavor 0.6B --out /data00/meshy/kern/ulp.json'
-awb release v100gpu kern
-```
+| arm | storage | forward dtype (measured) | finite params after step | changed params | scaler |
+|---|---|---|---|---|---|
+| uniform fp16 (old default) | fp16 | fp16 | **9 / 596,049,920 (~0%)** | **0 (0%)** | none |
+| fp32 master + FSDP fp16 (new default) | fp32 | **fp16** (input and weight, hook-verified) | 100% | **596,029,531 (99.997%)** | 65536, 0 skipped |
 
-Expected: fp16 arm shows a small `changed_fraction` (updates rounding
-away, quantile of |Δ|/ULP near 0), fp32 arm ~1.0 changed. Then the SGLang
-smoke (triton/pytorch/fp16, no graph) — if RMSNorm raises "no kernel
-image", that is the one candidate for a TileLang kernel or the sgl-kernel
-sm70 rebuild; decide from env's actual failure list rather than
-speculatively.
+Two independent findings:
+
+1. Without a GradScaler the fp16 backward overflows the vocabulary logits
+   immediately (loss ~12.5 over 152k classes): after one step effectively
+   every parameter is NaN/Inf, so uniform fp16 is not merely imprecise, it
+   is numerically dead. This dominates the ULP concern.
+2. FSDP `MixedPrecisionPolicy(param_dtype=fp16)` demonstrably applies at
+   world size 1: storage stays fp32 (`storage_dtypes_seen=["float16",
+   "float32"]` — the transient unsharded working copy plus the fp32
+   master), while the qkv leaf's weight and input inside forward are both
+   float16. Median applied update is ~2144 master ULPs — nothing is
+   swallowed; fp32 master + fp16 compute is the correct sm70 configuration
+   and is now the recipe default.
+
+### Remaining item: SGLang RMSNorm smoke
+
+The training path is verified; the inference side still needs one
+`--attention-backend triton --sampling-backend pytorch --dtype half
+--disable-cuda-graph` generate on the box (env's T1 smoke covers this).
+If RMSNorm raises "no kernel image", the fallback order is: source-built
+sgl-kernel with `-gencode=arch=compute_70,code=sm_70`; else patch
+`layernorm.py:forward_cuda` major < 8 to `sglang.jit_kernel.norm` /
+`forward_native`; a TileLang kernel is the last resort, only for a
+measured hotspot — not before.
