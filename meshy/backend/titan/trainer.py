@@ -138,10 +138,15 @@ class TitanTrainer(ForgeEngine):
         # plumbing (``ModelSpec.loss``) and reads an unbound
         # ``parallelism_config``; patch both in before the engine runs. See
         # :mod:`meshy.backend.titan.compat`.
+        # ``step`` must exist before the super call: ForgeEngine builds the
+        # CheckpointManager and runs DCP load inside __init__, which calls
+        # load_state_dict() on this object. Defining it afterwards would
+        # clobber the resumed step back to 0.
+        self.step = 0
+        self._pending_scaler_state: dict[str, Any] | None = None
         apply_forge_engine_compat(job_config)
         super().__init__(job_config)
 
-        self.step = 0
         self.seq_len = self.config.training.seq_len
         self.micro_batch_size = max(1, micro_batch_size)
         self.mini_batch_size = max(self.micro_batch_size, mini_batch_size)
@@ -181,6 +186,11 @@ class TitanTrainer(ForgeEngine):
         self.grad_scaler = torch.cuda.amp.GradScaler(
             enabled=(self.config.training.mixed_precision_param == "float16")
         )
+        # DCP load runs inside ForgeEngine.__init__, before the scaler is
+        # constructed; its state is parked and replayed here.
+        if self._pending_scaler_state is not None:
+            self.grad_scaler.load_state_dict(self._pending_scaler_state)
+            self._pending_scaler_state = None
         self.sharder = CpSharder(
             self.parallel_dims,
             load_balancer=self.config.parallelism.context_parallel_load_balancer,
@@ -1126,7 +1136,14 @@ class TitanTrainer(ForgeEngine):
     # ------------------------------------------------------------------
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step}
+        return {"step": self.step, "loss_scale": self.grad_scaler.state_dict()}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.step = state_dict["step"]
+        scaler_sd = state_dict.get("loss_scale")
+        if scaler_sd is not None:
+            if hasattr(self, "grad_scaler"):
+                self.grad_scaler.load_state_dict(scaler_sd)
+            else:
+                # DCP load happens before the GradScaler is constructed.
+                self._pending_scaler_state = scaler_sd

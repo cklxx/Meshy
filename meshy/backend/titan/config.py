@@ -136,6 +136,8 @@ def build_forge_config(
             # intentionally independent from XRL_CHECKPOINT_DIR, which is
             # reserved for exported HF weights consumed by inference.
             folder=trainer.checkpoint_folder,
+            interval=trainer.checkpoint_interval,
+            keep_latest_k=trainer.checkpoint_keep,
             initial_load_path=hf_model_path,
             initial_load_in_hf=bool(hf_model_path),
             initial_load_model_only=True,
