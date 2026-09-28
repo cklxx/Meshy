@@ -76,28 +76,37 @@ Verify arch support without initialising the device:
 $PY -c "import torch; assert 'sm_70' in torch.cuda.get_arch_list(); print(torch.__version__, torch.version.cuda)"
 ```
 
-## Serving on the V100 — BLOCKED upstream (sm75 floor)
+## Serving on the V100 — works via the in-tree sm70 patch
 
-SGLang 0.5.18 **does not start on sm70**, independent of flags. Three layers
-each require sm75+: SGLang's own gate
-(`maybe_downgrade_dtype_for_legacy_gpu`, "SGLang only supports sm75 and above"),
-sglang-kernel (no sm70 wheel in any published version, no sdist), and
-FlashInfer ("requires GPUs with sm75 or higher"). Downgrading SGLang does not
-avoid it. The intended command once the kernel stack has an sm70 path (kern's
-TileLang replacement) is:
+SGLang 0.5.18 upstream floors at sm75 (its own gate, sglang-kernel with no sm70
+binary, FlashInfer). `SGLangService` detects capability (7,0) and applies
+`meshy.backend.sglang_sm70` automatically: it bypasses the dtype gate, stubs
+sgl_kernel, forces fused ops to pure-torch, pins the CUDA 12.6 runtime, and
+adds the flags below (triton attention, pytorch sampling, eager graphs,
+weights CPU backup for memory saver). No site-packages edits.
+
+Meshy applies this itself when running on V100; to launch sglang directly use
+the patched launcher (`MESHY_SGLANG_SM70=1` + the bootstrap PYTHONPATH), e.g.
+`scripts`-side see `sm70_sglang_patched.sh` on the box. Equivalent flags:
 
 ```bash
 $PY -m sglang.launch_server \
     --model-path /data00/meshy/models/Qwen3-0.6B \
-    --disable-cuda-graph \
+    --dtype float16 \
     --attention-backend triton \
-    --dtype float16
+    --sampling-backend pytorch \
+    --cuda-graph-backend-decode disabled \
+    --cuda-graph-backend-prefill disabled \
+    --enable-memory-saver --enable-weights-cpu-backup
 ```
 
-Full tracebacks and the hot-path operator list: [v100_sm70_failures.md](v100_sm70_failures.md).
+Measured Qwen3-0.6B fp16: 20.1 tok/s single, 601 agg tok/s batch 64; release
+28.4GB -> 1.7GB and generation stays correct after resume. Mechanism, op
+profile and both-backend comparison: [v100_sm70_failures.md](v100_sm70_failures.md).
 
 ## What does run
 
+- SGLang Qwen3-0.6B fp16 generate (triton / torch_native), release/resume: PASS.
 - torchtitan Qwen3-0.6B one fwd+bwd step in fp32 and fp16: PASS.
 - CPU pytest subset (17 files): 87 passed.
 
