@@ -147,7 +147,7 @@ BATCH_SIZE = ROLLOUT_BATCH * GROUP_SIZE  # trainer trigger threshold: 64
 #     overrunning it (the framework otherwise stops only on dataset
 #     exhaustion; with lr_decay_ratio=0 the scheduler asserts on the first
 #     step past ``steps`` — stable_steps == steps+1).
-RL_STEPS = int(os.environ.get("XRL_STEPS", "1000"))
+RL_STEPS = int(os.environ.get("XRL_STEPS", "300"))
 # GradScaler/LR proof: 8 epochs x 7473 train rows / 8 prompts = ~7473
 # possible batches; the bound below is what actually stops the run.
 
@@ -257,6 +257,12 @@ def _rollout_group() -> ServiceGroup:
             poll_interval=2.0,
             pacing_window=1,
             num_epochs=int(os.environ.get("XRL_EPOCHS", "1")),
+            # In-loop holdout (200x1 at v0/50/.../250), milestone copy and
+            # old-version pruning. Fires on the first group after each new
+            # weight grant, so eval runs under the exact version with the
+            # trainer blocked. v300 has no rollout window (the bounded dataset
+            # serves exactly 300 batches), so its 200x4 eval is standalone.
+            version_hook="recipe.v100_inloop:version_hook",
         ),
     )
 

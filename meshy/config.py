@@ -295,6 +295,15 @@ class RolloutServiceConfig(ServiceConfig):
     #: back until the critic publishes one. Mutually exclusive with
     #: ``advantage``. See :class:`meshy.config.CriticServiceConfig`.
     external_advantage: bool = False
+    #: Optional async/sync callable invoked once per weight version, after the
+    #: colocated engine has been granted the GPU and loaded the new weights but
+    #: before that window's first request is generated. Signature
+    #: ``hook(*, version, engine, model_path, **version_hook_kwargs)``. Use for
+    #: in-loop holdout evals and old-checkpoint pruning: the trainer blocks on
+    #: this window's data while the hook runs, so no release/abort can interrupt
+    #: it and every request is served under the hook's exact version.
+    version_hook: str | Callable[..., Any] | None = None
+    version_hook_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.oversample_factor < 1.0:

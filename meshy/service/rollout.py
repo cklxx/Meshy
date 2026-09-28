@@ -71,6 +71,8 @@ def _build_rollout_worker(
         trajectory_log=trajectory_log,
         verbose_trajectory_log=bool(kwargs.get("verbose_trajectory_log", False)),
         external_advantage=bool(kwargs.get("external_advantage", False)),
+        version_hook=kwargs.get("version_hook"),
+        version_hook_kwargs=kwargs.get("version_hook_kwargs", {}),
         colocation=colocation,
     )
 

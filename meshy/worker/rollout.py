@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib
+import inspect
 import json
 import math
 import os
@@ -201,6 +202,8 @@ class RolloutWorker(TQWorker):
         trajectory_log: str | None = None,
         verbose_trajectory_log: bool = False,
         external_advantage: bool = False,
+        version_hook: str | Callable[..., Any] | None = None,
+        version_hook_kwargs: dict[str, Any] | None = None,
         client_factory=None,
         colocation: ColocationManager | None = None,
     ) -> None:
@@ -273,6 +276,12 @@ class RolloutWorker(TQWorker):
             if trajectory_log
             else None
         )
+        self.version_hook_fn = (
+            resolve_callable(version_hook) if version_hook is not None else None
+        )
+        self.version_hook_kwargs = dict(version_hook_kwargs or {})
+        self._hooks_run: set[int] = set()
+        self._version_hook_lock = asyncio.Lock()
 
         gen_gate_fields = ("gate_step", "weight_version")
         gen_gate_partition = "gen_gate"
@@ -380,8 +389,32 @@ class RolloutWorker(TQWorker):
             )
         await asyncio.to_thread(self.colocation.wait_for_grant, self._colocation_request)
 
+    async def _run_version_hook(self, version: int) -> None:
+        """Run the version hook exactly once per weight version.
+
+        The caller is the first group of a new GPU grant, so the engine has
+        already resumed and loaded ``version`` and the trainer is blocked
+        waiting for this window's data. Other groups of the same version wait
+        on the lock rather than skipping ahead.
+        """
+        if self.version_hook_fn is None or version in self._hooks_run:
+            return
+        async with self._version_hook_lock:
+            if version in self._hooks_run:
+                return
+            result = self.version_hook_fn(
+                version=version,
+                engine=self.engine,
+                model_path=self.model_path,
+                **self.version_hook_kwargs,
+            )
+            if inspect.isawaitable(result):
+                await result
+            self._hooks_run.add(version)
+
     async def rollout_group(self, builder: Any, prompt: Any, weight_version: int) -> list[Any] | None:
         await self._ensure_colocation()
+        await self._run_version_hook(weight_version)
         group = [copy.deepcopy(prompt) for _ in range(self.group_size)]
 
         async def rollout_one(sample: Any) -> Any:
