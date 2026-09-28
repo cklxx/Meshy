@@ -18,6 +18,20 @@ instead of bf16, and CUDA graph disabled.
 - **nvcc 12.4** for any JIT compile (Triton/TileLang): default `/usr/bin/nvcc`
   is 11.8 and rejects `-std=c++20`. `export PATH=/usr/local/cuda-12.4/bin:$PATH`.
 
+## Network: bypass the corp proxy
+
+Measured 2026-09-28 from this host (`curl -4L`, same ~60MB `nvidia-curand-cu12`
+wheel, 20s cap):
+
+| source | via proxy | direct (`--noproxy '*'`) |
+|---|---|---|
+| download.pytorch.org/whl/cu126 | 0.95 MB/s | **3.03 MB/s** |
+| mirrors.aliyun.com/pytorch-wheels/cu126 | 0.95 MB/s | 2.68 MB/s |
+
+Direct egress is ~3x faster. All install commands below assume
+`unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`.
+`pypi.tuna`/`bytedpypi` were unreachable/unpopulated for cu126 wheels at test time.
+
 ## Steps
 
 ```bash
@@ -35,13 +49,20 @@ PYPI=https://mirrors.aliyun.com/pypi/simple/
 uv pip install --python $PY --prerelease=allow sglang==0.5.18 --index-url $PYPI
 
 # 2. cu126 torch (includes sm_70 in get_arch_list())
+# NOTE: on this box direct egress is ~3x faster than the corp proxy.
+# If installs stall, `unset http_proxy https_proxy` first.
 uv pip install --python $PY \
     torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0 \
     --index-url https://download.pytorch.org/whl/cu126 --force-reinstall
 
-# 3. sglang kernels
+# 3. sglang kernels (cu126 index). sglang-kernel pins a cu13 torch, so
+#    step 2 MUST be re-run after this to pin torch back to cu126 — otherwise
+#    torch becomes 2.13.0+cu130 (arch_list starts at sm_75, no sm_70).
 uv pip install --python $PY sglang-kernel \
     --index-url https://docs.sglang.ai/whl/cu126/ --force-reinstall
+uv pip install --python $PY \
+    torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0 \
+    --index-url https://download.pytorch.org/whl/cu126 --force-reinstall
 
 # 4. torchtitan / TransferQueue / meshy
 uv pip install --python $PY third_party/torchtitan-0.1.0.dev20260501+cu126-py3-none-any.whl --index-url $PYPI
