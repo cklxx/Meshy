@@ -174,6 +174,13 @@ class TitanTrainer(ForgeEngine):
         # ``time/train/*`` metrics, skipping the ``cuda.synchronize``
         # calls that would otherwise serialise every stage.
         self.timer_enabled = bool(timer_enabled)
+        # FSDP's MixedPrecisionPolicy all-gathers fp32 master params into this
+        # dtype for the forward (it applies even at world size 1). fp16
+        # matmuls need dynamic loss scaling to survive backward; bf16/fp32 do
+        # not. The scaler is a no-op wrapper when disabled.
+        self.grad_scaler = torch.cuda.amp.GradScaler(
+            enabled=(self.config.training.mixed_precision_param == "float16")
+        )
         self.sharder = CpSharder(
             self.parallel_dims,
             load_balancer=self.config.parallelism.context_parallel_load_balancer,
@@ -879,6 +886,9 @@ class TitanTrainer(ForgeEngine):
         for key, value in plan_stats(plan, self.batch_layout).items():
             result[f"train/{key}"] = float(value)
         result["num_mini_batches"] = float(len(plan))
+        # Dynamic GradScaler value (1.0 when scaling is off); a falling value
+        # signals repeated fp16 overflows.
+        result["train/loss_scale"] = float(self.grad_scaler.get_scale())
         # Rank-local by construction (this rank's DP slice); the caller only
         # logs rank 0, same as the rollout statistics.
         result.update(gae_metrics)
@@ -927,7 +937,7 @@ class TitanTrainer(ForgeEngine):
                     )
                     del new_lp, entropy
                 with timer.timer("train/backward", sync=True):
-                    loss.backward()
+                    self.grad_scaler.scale(loss).backward()
             if sums is None:
                 sums = mb_sums
             else:
@@ -940,6 +950,10 @@ class TitanTrainer(ForgeEngine):
             torch.cuda.empty_cache()
 
         with timer.timer("train/clip_grad_norm", sync=True):
+            # Unscale once before the norm so clipping sees true gradients;
+            # a disabled scaler's ``unscale_`` is a no-op.
+            for optimizer in self.optimizers:
+                self.grad_scaler.unscale_(optimizer)
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for part in self.model_parts for p in part.parameters()],
                 self.config.training.max_norm,
@@ -949,7 +963,10 @@ class TitanTrainer(ForgeEngine):
             )
         with timer.timer("train/optim_step", sync=True):
             self.checkpointer.maybe_wait_for_staging()
-            self.optimizers.step()
+            for optimizer in self.optimizers:
+                # Skips the underlying step on inf gradients (fp16 overflow).
+                self.grad_scaler.step(optimizer)
+            self.grad_scaler.update()
 
         assert sums is not None
         return self._reduce_mini_metrics(sums), grad_norm

@@ -63,6 +63,14 @@ def _get_model_spec(model_name: str, model_flavor: str, attn_backend: str = "sdp
     )
 
 
+def _resolve_mixed_precision_param(trainer: "TrainerConfig") -> str:
+    if trainer.mixed_precision_param is not None:
+        return trainer.mixed_precision_param
+    # Uniform-fp16 storage must compute in fp16 too; the default otherwise
+    # stays torchtitan's bfloat16 (fp32 master + bf16 matmuls, sm80+).
+    return "float16" if trainer.dtype == "float16" else "bfloat16"
+
+
 def build_forge_config(
     trainer: "TrainerConfig",
     hf_model_path: str | None = None,
@@ -104,6 +112,7 @@ def build_forge_config(
             max_norm=trainer.max_norm,
             steps=trainer.steps,
             dtype=trainer.dtype,
+            mixed_precision_param=_resolve_mixed_precision_param(trainer),
         ),
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=trainer.dp_shard_degree,

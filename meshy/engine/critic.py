@@ -114,7 +114,7 @@ class CriticSpmdEngine(SpmdEngine):
         )
 
         from meshy.backend.titan.critic.engine import CriticEngine
-        from meshy.backend.titan.config import _get_model_spec
+        from meshy.backend.titan.config import _get_model_spec, _resolve_mixed_precision_param
 
         cfg = self.trainer_config
         spec = _get_model_spec(
@@ -133,6 +133,7 @@ class CriticSpmdEngine(SpmdEngine):
             max_norm=self.max_norm,
             steps=cfg.steps,
             dtype=cfg.dtype,
+            mixed_precision_param=_resolve_mixed_precision_param(cfg),
         )
         self.critic = CriticEngine(
             spec.model,
