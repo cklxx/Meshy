@@ -206,13 +206,15 @@ class StudentTopKTrainer(TitanTrainer):
                 with timer.timer("train/forward", sync=True):
                     loss, mb_sums = self._distill_loss(mb, mini)
                 with timer.timer("train/backward", sync=True):
-                    loss.backward()
+                    self.grad_scaler.scale(loss).backward()
             sums = mb_sums if sums is None else {k: sums[k] + v for k, v in mb_sums.items()}
             del mb, loss, mb_sums
 
         with timer.timer("train/empty_cache", sync=True):
             torch.cuda.empty_cache()
         with timer.timer("train/clip_grad_norm", sync=True):
+            for optimizer in self.optimizers:
+                self.grad_scaler.unscale_(optimizer)
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for part in self.model_parts for p in part.parameters()],
                 self.config.training.max_norm,
@@ -222,7 +224,9 @@ class StudentTopKTrainer(TitanTrainer):
             )
         with timer.timer("train/optim_step", sync=True):
             self.checkpointer.maybe_wait_for_staging()
-            self.optimizers.step()
+            for optimizer in self.optimizers:
+                self.grad_scaler.step(optimizer)
+            self.grad_scaler.update()
         assert sums is not None
         return self._reduce_mini_metrics(sums), grad_norm
 

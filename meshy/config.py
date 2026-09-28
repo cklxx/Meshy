@@ -33,7 +33,16 @@ class TrainerConfig:
     model_flavor: str = "1.7B"
     seq_len: int = 2048
     steps: int = 100
-    dtype: str = "bfloat16"
+    #: Parameter storage dtype (master weights, gradients, Adam moments).
+    #: "bfloat16" needs Ampere+ tensor cores; sm70 (V100) uses "float32"
+    #: storage with ``mixed_precision_param="float16"`` (fp32 master weights,
+    #: fp16 matmuls + dynamic loss scaling). "float16" storage is the
+    #: uniform-fp16 variant.
+    dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
+    #: FSDP all-gather param dtype, i.e. the forward compute dtype. ``None``
+    #: keeps torchtitan's default (bfloat16). Set "float16" for sm70. A
+    #: dynamic GradScaler switches on automatically when this is "float16".
+    mixed_precision_param: Literal["bfloat16", "float16", "float32"] | None = None
     max_norm: float = 1.0
     local_batch_size: int = 4
     global_batch_size: int = -1
@@ -77,6 +86,17 @@ class TrainerConfig:
     attn_backend: Literal["sdpa", "varlen"] = "sdpa"
 
     def __post_init__(self) -> None:
+        if self.dtype not in ("bfloat16", "float16", "float32"):
+            raise ValueError(
+                f"dtype must be 'bfloat16', 'float16' or 'float32', got {self.dtype!r}"
+            )
+        if self.mixed_precision_param is not None and self.mixed_precision_param not in (
+            "bfloat16", "float16", "float32",
+        ):
+            raise ValueError(
+                "mixed_precision_param must be None or one of "
+                f"'bfloat16'/'float16'/'float32', got {self.mixed_precision_param!r}"
+            )
         if self.attn_backend not in ("sdpa", "varlen"):
             raise ValueError(
                 f"attn_backend must be 'sdpa' or 'varlen', got {self.attn_backend!r}"
