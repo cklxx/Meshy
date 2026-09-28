@@ -15,8 +15,8 @@ from meshy.service.topology import build_topology
 from meshy.worker.titan import TitanWorker
 
 
-def test_publisher_updates_only_inference_outside_colocation_ring(monkeypatch) -> None:
-    calls: list[tuple[str, dict]] = []
+def test_publisher_skips_l3_clear_when_backend_disabled(monkeypatch) -> None:
+    calls: list[tuple[str, dict | None, float]] = []
 
     class Response:
         def raise_for_status(self) -> None:
@@ -38,79 +38,108 @@ def test_publisher_updates_only_inference_outside_colocation_ring(monkeypatch) -
         managed_names={"actor-infer-0"},
     )
 
-    # Weight push, then mandatory L3 invalidation on the same replica.
-    assert [(u, j) for u, j, _ in calls] == [
+    # Only the weight push; no clear because the replica has no L3 backend.
+    assert calls == [
         (
             "http://infer:30001/update_weights_from_disk",
             {"model_path": "/runtime/weights/titan/v3"},
-        ),
-        ("http://infer:30001/clear_hicache_storage_backend", None),
+            1800.0,
+        )
     ]
-    assert calls[0][2] == 1800.0
 
 
-def test_publisher_tolerates_replica_without_hicache_backend(monkeypatch) -> None:
-    import httpx as _httpx
+def test_publisher_clears_l3_when_backend_enabled(monkeypatch) -> None:
+    calls: list[str] = []
 
-    class Ok:
+    class Response:
         def raise_for_status(self) -> None:
             return None
 
-    class NotFound(_httpx.HTTPStatusError):
-        def __init__(self) -> None:
-            resp = SimpleNamespace(status_code=404)
-            super().__init__("no backend", request=SimpleNamespace(), response=resp)
-
-    sequence = ["update", "clear"]
-
     def post(url: str, *, json: dict | None = None, timeout: float = 0.0):
-        stage = sequence.pop(0)
-        if stage == "clear":
-            raise NotFound()
-        return Ok()
+        calls.append(url)
+        return Response()
 
     monkeypatch.setattr(httpx, "post", post)
-    # Must not raise: 404 on the clear endpoint just means L3 is disabled.
     _publish_weights_to_inference(
-        [{"name": "s", "endpoint": "http://infer:30001/"}],
+        [{"name": "s", "endpoint": "http://infer:30001/",
+          "hicache_storage_enabled": True}],
         "/w/v1", 1, "titan", managed_names=set(),
     )
-    assert sequence == []
+
+    assert [u.replace("http://infer:30001", "") for u in calls] == [
+        "/update_weights_from_disk",
+        "/clear_hicache_storage_backend",
+    ]
 
 
-def test_load_weights_clears_hicache_l3(monkeypatch) -> None:
-    """A weight swap must invalidate token-keyed L3 KV (regression: stale old-
-    policy KV otherwise survives SGLang's GPU-radix-only flush and is read
-    under the new weights). Fails if the clear endpoint is not called."""
+def test_load_weights_does_not_touch_l3_when_disabled(monkeypatch) -> None:
+    """With no L3 backend configured, not one request may hit the clear
+    endpoint (SGLang answers 400 there and would abort the first sync)."""
     import requests
 
-    posted: list[str] = []
-
-    class Resp:
-        def __init__(self, status: int = 200) -> None:
-            self.status_code = status
-
-        def raise_for_status(self) -> None:
-            if self.status_code >= 400:
-                raise requests.HTTPError("boom", response=self)
-
     def fake_request(url: str, **kwargs):
-        posted.append(f"POST {url}")
-        return Resp(200)
+        assert not url.endswith("/clear_hicache_storage_backend"), url
+        return SimpleNamespace(raise_for_status=lambda: None)
 
     monkeypatch.setattr(requests, "post", fake_request)
     monkeypatch.setattr(requests, "get", fake_request)
 
-    engine = SGLangEngine(["http://infer:30000"])
+    engine = SGLangEngine(["http://infer:30000"])  # default: L3 off
+    assert engine.hicache_storage_enabled is False
     try:
         engine.load_weights("/weights/v9")
     finally:
         asyncio.run(engine.close())
 
-    assert any(url.endswith("/update_weights_from_disk") for _, url in
-               (p.split(" ", 1) for p in posted))
-    assert any(url.endswith("/clear_hicache_storage_backend") for _, url in
-               (p.split(" ", 1) for p in posted)), posted
+
+def test_load_weights_clears_hicache_l3(monkeypatch) -> None:
+    """When L3 is configured, a weight swap must invalidate token-keyed L3 KV
+    (regression: stale old-policy KV otherwise survives SGLang's GPU-radix-only
+    flush and is read under the new weights). Fails if clear is not called."""
+    import requests
+
+    posted: list[str] = []
+
+    def fake_request(url: str, **kwargs):
+        posted.append(url)
+        return SimpleNamespace(raise_for_status=lambda: None)
+
+    monkeypatch.setattr(requests, "post", fake_request)
+    monkeypatch.setattr(requests, "get", fake_request)
+
+    engine = SGLangEngine(["http://infer:30000"],
+                          hicache_storage_enabled=True)
+    try:
+        engine.load_weights("/weights/v9")
+    finally:
+        asyncio.run(engine.close())
+
+    assert any(u.endswith("/update_weights_from_disk") for u in posted)
+    assert any(u.endswith("/clear_hicache_storage_backend") for u in posted), posted
+
+
+def test_load_weights_propagates_l3_clear_failure(monkeypatch) -> None:
+    """A configured L3 that fails to clear must raise (stale KV is unsafe)."""
+    import pytest
+    import requests
+
+    def fake_request(url: str, **kwargs):
+        if url.endswith("/clear_hicache_storage_backend"):
+            err = requests.HTTPError("boom")
+            err.response = SimpleNamespace(status_code=500)
+            raise err
+        return SimpleNamespace(raise_for_status=lambda: None)
+
+    monkeypatch.setattr(requests, "post", fake_request)
+    monkeypatch.setattr(requests, "get", fake_request)
+
+    engine = SGLangEngine(["http://infer:30000"],
+                          hicache_storage_enabled=True)
+    try:
+        with pytest.raises(requests.HTTPError):
+            engine.load_weights("/weights/v9")
+    finally:
+        asyncio.run(engine.close())
 
 
 def test_sglang_colocate_acquire_uses_checkpoint_from_grant() -> None:

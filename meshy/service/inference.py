@@ -50,6 +50,11 @@ def _augment_path(env: dict[str, str]) -> None:
     env["PATH"] = os.pathsep.join([*extra, existing]) if existing else os.pathsep.join(extra)
 
 
+def _hicache_storage_enabled(server_args: dict) -> bool:
+    """True iff SGLang is launched with an HiCache L3 storage backend."""
+    return bool(server_args.get("hicache_storage_backend"))
+
+
 def _server_args_to_cli(server_args: dict) -> list[str]:
     argv: list[str] = []
     for key, value in server_args.items():
@@ -140,7 +145,10 @@ class SGLangService(Service):
         # Each replica manages its own server during readiness. The
         # colocation leader additionally needs a full-replica client because a
         # token hand-off restores/releases the whole inference pool at once.
-        self.engine = SGLangEngine([self.endpoint])
+        self.engine = SGLangEngine(
+            [self.endpoint],
+            hicache_storage_enabled=_hicache_storage_enabled(self.server_args),
+        )
         self.engine.model_path = self.model_path
         self._group_endpoints = endpoints
         self.colocation_engine = None
@@ -238,7 +246,10 @@ class SGLangService(Service):
             self.engine.release_for_colocate()
             if self.is_colocation_leader:
                 if self.colocation_engine is None:
-                    self.colocation_engine = SGLangEngine(self._group_endpoints or [self.endpoint])
+                    self.colocation_engine = SGLangEngine(
+                        self._group_endpoints or [self.endpoint],
+                        hicache_storage_enabled=_hicache_storage_enabled(self.server_args),
+                    )
                     self.colocation_engine.model_path = self.model_path
                 manager_engine = self.colocation_engine
                 self.colocation_manager = self.build_colocation_manager(

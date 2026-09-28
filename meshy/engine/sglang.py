@@ -67,6 +67,7 @@ class SGLangEngine:
         backoff: float = 1.0,
         backoff_max: float = 5.0,
         max_continuations: int = 128,
+        hicache_storage_enabled: bool = False,
     ) -> None:
         if isinstance(endpoints, str):
             endpoints = [endpoints]
@@ -78,6 +79,11 @@ class SGLangEngine:
         self._endpoint_lock = threading.Lock()
         self.sampling_params = dict(sampling_params or {})
         self.model_path: str | None = None
+        # Whether this server was launched with an HiCache L3 backend. Only
+        # then is /clear_hicache_storage_backend valid; when L3 is off SGLang
+        # answers 400 ("Hierarchical cache is not enabled"), so we must decide
+        # from config and never probe the endpoint.
+        self.hicache_storage_enabled = bool(hicache_storage_enabled)
         self.attempts = max(1, int(attempts))
         self.backoff = max(0.0, float(backoff))
         self.backoff_max = max(0.0, float(backoff_max))
@@ -293,29 +299,24 @@ class SGLangEngine:
         # does NOT touch the L3 storage backend, whose keys are token-only and
         # carry no weight version. Without this, a same-prompt rollout on the
         # new weights would read stale L3 KV and silently diverge from the
-        # recorded logprobs. Drop L3 on every weight swap.
+        # recorded logprobs. Only call when this server actually has L3.
         self.clear_hicache_storage()
 
     def clear_hicache_storage(self) -> None:
-        """Invalidate the HiCache L3 backend on every rank.
+        """Invalidate the HiCache L3 backend after a weight swap.
 
-        No-op unless an L3 backend is configured (the endpoint then 404s).
+        No-op unless the server was configured with an L3 backend. When it is,
+        a clear failure is fatal (stale KV would corrupt the next rollout).
         """
+        if not self.hicache_storage_enabled:
+            return
         import requests
 
         for endpoint in self._endpoint_values:
-            try:
-                requests.post(
-                    f"{endpoint}/clear_hicache_storage_backend", timeout=300.0
-                ).raise_for_status()
-                logger.info("SGLang {} cleared HiCache L3 after weight update", endpoint)
-            except requests.RequestException as exc:
-                # 404 = no L3 backend attached; anything else is worth surfacing
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 404:
-                    logger.debug("SGLang {} has no HiCache L3 backend to clear", endpoint)
-                else:
-                    raise
+            requests.post(
+                f"{endpoint}/clear_hicache_storage_backend", timeout=300.0
+            ).raise_for_status()
+            logger.info("SGLang {} cleared HiCache L3 after weight update", endpoint)
 
     def release_for_colocate(self) -> None:
         self.pause_generation()
