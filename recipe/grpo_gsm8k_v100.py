@@ -196,7 +196,12 @@ def _trainer_params() -> TrainerParamsConfig:
     # Mirrors recipe/justrl: 8-sample mini-batch, micro 1, asymmetric clip,
     # old logprobs recomputed inside the train pass. XRL_MINI_BATCH scales with
     # the rollout window so optimizer updates/window stay 8 (64/8 or 512/64).
-    return TrainerParamsConfig(
+    # XRL_MAX_TOKENS_PER_MICRO switches from per-row to per-token micro
+    # sizing (padded/sdpa; packed/varlen needs flash_attn sm75+ + bf16, which
+    # V100 lacks). Token budget takes precedence over micro_batch_size and cuts
+    # the number of micro-forward passes in a 512 window ~5x (512 -> ~104).
+    mtpm = os.environ.get("XRL_MAX_TOKENS_PER_MICRO")
+    params = dict(
         mini_batch_size=int(os.environ.get("XRL_MINI_BATCH", "8")),
         micro_batch_size=1,
         seq_bucket=1024,
@@ -204,6 +209,10 @@ def _trainer_params() -> TrainerParamsConfig:
         ppo_clip_eps_high=0.28,
         old_logprobs_source="train",
     )
+    if mtpm:
+        params["batch_layout"] = "padded"
+        params["max_tokens_per_micro"] = int(mtpm)
+    return TrainerParamsConfig(**params)
 
 
 def _inference_config() -> InferenceServiceConfig:
