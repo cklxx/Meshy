@@ -50,6 +50,44 @@ def _is_sm70() -> bool:
         return False
 
 
+def _preload_bundled_cudart() -> None:
+    """Force the torch-bundled CUDA 12.6 runtime globally before SGLang imports.
+
+    ``sgl_kernel.load_utils._preload_cuda_library`` dlopens the CUDA-home
+    runtime (system 12.4 on this box) with RTLD_GLOBAL. That library predates
+    ``cudaGetDriverEntryPointByVersion``; when torch's libc10_cuda then binds
+    against it, import fails with
+    ``undefined symbol: cudaGetDriverEntryPointByVersion, version libcudart.so.12``.
+    Loading the torch wheel's own 12.6 runtime first makes every later dlopen
+    of the same SONAME reuse it instead of the system one.
+    """
+    import ctypes
+    import glob
+    import os
+    import sys
+
+    candidates = sorted(
+        glob.glob(
+            os.path.join(
+                sys.prefix,
+                "lib",
+                "python*",
+                "site-packages",
+                "nvidia",
+                "cuda_runtime",
+                "lib",
+                "libcudart.so.12*",
+            )
+        )
+    )
+    if not candidates:
+        return
+    # prefer the plain SONAME then the newest versioned file
+    plain = [c for c in candidates if os.path.basename(c) == "libcudart.so.12"]
+    target = (plain or candidates)[0]
+    ctypes.CDLL(target, mode=ctypes.RTLD_GLOBAL)
+
+
 class _StubCommonOps:
     """Stand-in for sgl_kernel's compiled ``common_ops`` shared object.
 
@@ -135,6 +173,9 @@ def apply_sm70_patch() -> bool:
     global APPLIED
     if APPLIED:
         return True
+
+    # Must precede the first torch import so libc10_cuda binds CUDA 12.6 runtime.
+    _preload_bundled_cudart()
     if not _is_sm70():
         return False
 
