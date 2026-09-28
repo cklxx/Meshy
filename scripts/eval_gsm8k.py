@@ -71,7 +71,7 @@ def wait_healthy(base_url: str, timeout_s: int = 600) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            if requests.get(f"{base_url}/health_generate", timeout=5).status_code == 200:
+            if requests.get(f"{base_url}/health", timeout=5).status_code == 200:
                 return
         except requests.RequestException:
             pass
@@ -79,7 +79,7 @@ def wait_healthy(base_url: str, timeout_s: int = 600) -> None:
     raise RuntimeError(f"server at {base_url} not healthy after {timeout_s}s")
 
 
-def start_server(model: str, port: int, mem_fraction: float) -> subprocess.Popen:
+def start_server(model: str, port: int, mem_fraction: float, server_log: str) -> subprocess.Popen:
     # On sm70 (V100) SGLang 0.5.18 floors at sm75; Meshy's bootstrap patch
     # bypasses the gate, stubs sgl_kernel, forces native fused ops and pins
     # the CUDA 12.6 runtime. Harmless elsewhere (it no-ops off sm70).
@@ -102,7 +102,7 @@ def start_server(model: str, port: int, mem_fraction: float) -> subprocess.Popen
         "--port", str(port),
         "--host", "127.0.0.1",
     ]
-    logf = open(args.server_log, "w")
+    logf = open(server_log, "w")
     proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
     try:
         wait_healthy(f"http://127.0.0.1:{port}")
@@ -136,7 +136,7 @@ def main() -> None:
     base_url = args.base_url
     proc = None
     if base_url is None:
-        proc = start_server(args.model, args.port, args.mem_fraction)
+        proc = start_server(args.model, args.port, args.mem_fraction, args.server_log)
         base_url = f"http://127.0.0.1:{args.port}"
 
     try:
