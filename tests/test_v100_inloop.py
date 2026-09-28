@@ -62,3 +62,27 @@ def test_worker_hook_absent_is_noop():
     w = object.__new__(RolloutWorker)
     w.version_hook_fn = None
     asyncio.run(w._run_version_hook(3))
+
+
+class _BatchEncoding(dict):
+    # Mimics transformers BatchEncoding: apply_chat_template(tokenize=True)
+    # returns a mapping, not a plain id list.
+    pass
+
+
+def test_render_ids_normalizes_batch_encoding():
+    class FakeTok:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return _BatchEncoding(input_ids=[10, 20, 30], attention_mask=[1, 1, 1])
+
+    ids = inloop._render_ids(FakeTok(), [{"role": "user", "content": "x"}])
+    assert ids == [10, 20, 30]
+    assert all(isinstance(i, int) for i in ids)
+
+
+def test_render_ids_passes_plain_list():
+    class FakeTok:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+            return [1, 2, 3, 4]
+
+    assert inloop._render_ids(FakeTok(), []) == [1, 2, 3, 4]

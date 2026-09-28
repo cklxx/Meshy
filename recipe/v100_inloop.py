@@ -56,6 +56,14 @@ def _milestone_dir(root: str) -> str:
                         os.path.basename(root.rstrip("/")))
 
 
+def _render_ids(tok, messages: list[dict]) -> list[int]:
+    # Some transformers return a BatchEncoding from apply_chat_template; list()
+    # of that yields the dict keys, not token ids (the 400-on-every-request
+    # bug). Normalize exactly like meshy.utils.sample.SampleBuilder._render.
+    out = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+    return list(out["input_ids"] if hasattr(out, "keys") else out)
+
+
 def _build_prompts(model_path: str, rows):
     tok = AutoTokenizer.from_pretrained(model_path)
     prompts, gts = [], []
@@ -64,8 +72,7 @@ def _build_prompts(model_path: str, rows):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": row["question"] + SUFFIX},
         ]
-        prompts.append(tok.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True))
+        prompts.append(_render_ids(tok, messages))
         gts.append(_extract_gsm8k_answer(row["answer"]))
     return prompts, gts, tok
 

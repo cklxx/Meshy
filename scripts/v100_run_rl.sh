@@ -23,7 +23,7 @@ export XRL_STEPS=300
 export XRL_TQ_STORAGE_UNITS=1
 export XRL_RUNTIME_DIR=/3fs/stage/meshy/rollout/rl-formal-$(date +%Y%m%d-%H%M%S)
 echo "RUNTIME=$XRL_RUNTIME_DIR"
-echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || cat /data00/meshy/rl/COMMIT)"
+echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || cat DEPLOY_COMMIT 2>/dev/null || cat /data00/meshy/rl/COMMIT 2>/dev/null)"
 echo "GRAPH=$MESHY_SM70_CUDA_GRAPH START=$(date +%s)"
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
 
