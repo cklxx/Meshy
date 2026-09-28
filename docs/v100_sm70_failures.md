@@ -1,112 +1,92 @@
-# sm70 (V100) operator/import failure list — for TileLang replacement
+# sm70 (V100) SGLang compatibility — patch, results, operator profile
 
 Tesla V100-SXM2-32GB, compute capability **7.0 (sm_70)**, host driver 535/CUDA 12.2,
 nvcc 12.4. Env: torch 2.13.0+cu126 (arch_list sm_50..sm_90, **sm_70 present**),
-sglang **0.5.18**, sglang-kernel **0.4.6.post1** (its pin) / also tested 0.4.7,
-flashinfer-python 0.6.x, Python 3.12.14. Run 2026-09-28.
+sglang **0.5.18**, sglang-kernel **0.4.6.post1**, Python 3.12.14. Run 2026-09-28.
 
-## Headline: the whole SGLang kernel stack floors at sm75
+**Status: serving works.** A runtime patch (`meshy/backend/sglang_sm70.py`,
+applied automatically by `SGLangService` on capability (7,0)) makes SGLang
+0.5.18 serve Qwen3-0.6B fp16 end-to-end on V100 — correct generation, both
+torch_native (SDPA) and triton attention, pytorch sampling, eager graphs, and
+memory-saver release/resume. No site-packages files are edited.
 
-SGLang 0.5.18 cannot serve on V100. This is not one missing operator; three
-independent layers each hard-require sm75+:
+## Upstream floors the patch bypasses
 
-1. **SGLang itself** — explicit gate before any model op:
-   `sglang/srt/model_executor/model_runner_components/load_model_utils.py:79`
-   in `maybe_downgrade_dtype_for_legacy_gpu`:
-   ```python
-   if torch.cuda.get_device_capability()[1] < 5:
-       raise RuntimeError("SGLang only supports sm75 and above.")
-   ```
-   (sm70 minor version is 0 < 5; sm75 is 7,5.)
+Three independent sm75+ floors, all handled in the patch:
 
-2. **sglang-kernel ships no sm70 binaries.** Verified by listing the wheels and
-   with `cuobjdump --list-elf` (nvcc 12.4):
-   - 0.4.6.post1 / 0.4.7 (pypi): only `sgl_kernel/sm90/common_ops.so` and
-     `sgl_kernel/sm100/common_ops.so` — no sm70.
-   - legacy `sgl-kernel` 0.3.21: `common_ops` is sm90/sm100; `flash_ops.so`
-     fat binary is sm80/sm86/sm90; `spatial_ops.so` sm80/sm89/sm90/sm100/sm120.
-     Still no sm70.
-   - No sdist is published (wheels only), so there is no `pip` source build.
-   On import, `sgl_kernel/__init__.py` calls
-   `_load_architecture_specific_ops()`, which raises on sm70:
-   ```
-   ImportError:
-   Attempted locations:
-   1. .../sgl_kernel/sm100/common_ops.* (only sm100 present)
-   2. Fallback .../sgl_kernel/common_ops.* - found files: []
-   GPU Info:
-   - Compute capability: 70
-   - Expected variant: SM70 (precise math for compatibility)
-   - CUDA version: 12.6
-   Error details: libnvrtc.so.13: cannot open shared object file
-   ```
-   The loader *names* "SM70 (precise math)" but no wheel ships the variant.
+1. **SGLang gate** — `load_model_utils.maybe_downgrade_dtype_for_legacy_gpu:79`
+   raises "SGLang only supports sm75 and above." Replaced with the dtype-only
+   downgrade (fp16) it does for sm70..sm79, no raise.
+2. **sglang-kernel has no sm70 binary** — all wheels (0.4.x sm90/sm100; legacy
+   sgl-kernel 0.3.21 cuobjdump-verified sm80+; no sdist). A lazy
+   `sys.modules["common_ops"]` stub lets `import sgl_kernel` and its Python
+   submodules load; every hot-path CustomOp is forced to pure-torch
+   `forward_native` via SGLang's own `set_fused_op_backend(KernelBackend.TORCH)`
+   (`SGLANG_FORCE_FUSED_OP_BACKEND=native`), so the stub is never executed.
+3. **FlashInfer floor ("requires sm75")** — sidestepped: attention uses
+   `--attention-backend torch_native` (pure SDPA) or `triton`; sampling uses
+   `--sampling-backend pytorch`. Neither imports flashinfer on the hot path.
 
-3. **FlashInfer floors at sm75.** Even bypassing (1) and stubbing (2), the
-   forward pass dies at the first RMSNorm — sgl_kernel's Python wrapper falls
-   back to flashinfer, whose JIT rejects the arch:
-   `flashinfer/jit/core.py:109` `check_cuda_arch()`:
-   `RuntimeError: FlashInfer requires GPUs with sm75 or higher`.
+Plus an environment hazard: `sgl_kernel._preload_cuda_library` dlopens the
+system CUDA-home runtime (12.4) with RTLD_GLOBAL; it predates
+`cudaGetDriverEntryPointByVersion`, so torch's libc10_cuda fails to bind
+(undefined symbol) when memory saver runs. The patch preloads the torch
+wheel's own CUDA 12.6 runtime first (RTLD_GLOBAL), fixing the binding.
 
-Downgrading SGLang does not help: 0.5.10+ hard-pins sglang-kernel; 0.5.1
-pins legacy sgl-kernel (sm80+ per cuobjdump); flashinfer is the same sm75 wall
-regardless of SGLang version. The prebuilt-kernel assumption "sm75 and above"
-holds across the stack.
+## Acceptance results (Qwen3-0.6B fp16, single V100, GPU exclusive)
 
-## Hot-path operators that need an sm70 implementation
+Correctness: both attention backends answer GSM8K correctly (16-3-4=9, 9*2=
+**$18**); greedy "capital of France" -> "Paris".
 
-Diagnostic method: with the sm75 gate bypassed and the sgl_kernel native loader
-replaced by a lazy dummy (so imports succeed), the fp16 Qwen3-0.6B model loads
-and the forward begins. The first call into a missing kernel is the order below.
-Each native op is invoked as `torch.ops.sgl_kernel.<name>`; replacing the
-RMSNorm alone just surfaces the next one, so this is a set, not a single fix.
+| metric | torch_native (SDPA) | triton |
+|---|---|---|
+| single-stream decode (128 tok, incl prefill) | 16.38 tok/s | **20.10 tok/s** |
+| batch 64 aggregate (8192 tok) | 60.50 tok/s | **601.40 tok/s** |
+| memory release (weights+kv) | 28418 -> 510 MiB | 29612 -> 1708 MiB |
+| generation after resume | Paris (correct) | Paris (correct) |
 
-1. **RMSNorm** — every transformer block (28x in Qwen3-0.6B).
-   `sglang/srt/layers/layernorm.py:567` -> `sgl_kernel.rmsnorm`
-   -> `sgl_kernel/elementwise.py:114 rmsnorm` -> flashinfer fallback ->
-   `FlashInfer requires GPUs with sm75 or higher`.
-   Native symbol: `torch.ops.sgl_kernel.rmsnorm`.
+triton is the recommended sm70 backend: single-stream 1.2x and batch-64 ~10x
+faster than torch_native SDPA.
 
-Operators after RMSNorm were not reached (forward aborted at block 1). A full
-replacement pass should expect at minimum, in forward/serve order:
-rmsnorm / fused_add_rmsnorm, RoPE, the triton attention path itself (verify it
-JITs for sm70), the sampling/top-k path (`fast_topk`), KV-cache fill/copy
-(`assign_*_cache_locs`), and the all-reduce only if TP>1 (not needed for the
-single-card target). These are the candidates to enumerate by continuing the
-diagnostic run with an sm70 RMSNorm in place.
+Memory saver requires `--enable-weights-cpu-backup`: without it released
+weights have no host copy and resume runs on garbage (token 0 / "!!!!"). Resume
+is asynchronous; a caller must poll until output is correct.
 
-## What works on sm70 today (same venv)
+## Native-op profile at Qwen3-0.6B shapes (fp16, N=4096, 200 iters)
 
-- **torchtitan Qwen3-0.6B fwd+bwd: PASS** (native `model_registry`, random init,
-  meta -> to_empty(cuda) -> init_weights, batch 2x32):
-  ```
-  [fp32] logits=(2, 32, 151936) loss=10.6389 gradnorm=39.3386
-  [fp16] logits=(2, 32, 151936) loss=11.0263 gradnorm=38.2500
-  SM70_TITAN_TRAIN_STEP_PASS
-  ```
-  sdpa attention and torch ops run on sm70 in both fp32 and fp16.
-- **CPU pytest subset: 87 passed** (CUDA_VISIBLE_DEVICES="").
-- torch/torchaudio/torchvision/torchtitan/triton/meshy import clean; triton
-  attention backend is selectable in SGLang but is blocked upstream by the
-  gates above before it is exercised.
+Microbenchmark `scripts/sm70_op_bench.py`: per-call ms and share of the listed
+ops. Attention (SDPA) dominates; the three elementwise ops kern replaced are
+~22% combined at this shape.
 
-## Environment quirks (not sm70 kernels, but required to reproduce)
+| op | ms/call | share |
+|---|---|---|
+| sdpa_prefill N=4096 (causal) | 2.067 | 54.9% |
+| rope(q+k) | 0.563 | 15.0% |
+| fused_add_rmsnorm | 0.383 | 10.2% |
+| sdpa_decode KV=4096 | 0.292 | 7.7% |
+| rmsnorm | 0.245 | 6.5% |
+| silu_and_mul | 0.212 | 5.6% |
 
-- sglang-kernel pins a cu13 torch; force-reinstall the cu126 torch trio AFTER
-  installing it or torch silently becomes 2.13.0+cu130 (arch_list sm_75.., no
-  sm_70) with CUDA-version import errors.
-- httpx 0.28.1 cannot parse IPv6 CIDRs in the default `NO_PROXY`
-  (`fe80::/10`,`fd00::/8`): `httpx.InvalidURL: Invalid port ':'`. Set
-  `NO_PROXY=localhost,127.0.0.1,::1,<corp domains>`.
-- Direct egress is ~3x the corp proxy for wheel downloads; see v100_install.md.
+kern's TileLang rmsnorm/fused_add_rmsnorm/silu_and_mul
+(`meshy/kernels/__init__.py`, v100/kern ee8b168) are 3.9-14.9x faster than
+these torch-native kernels; the patch will select them via a
+`MESHY_SM70_TILELANG` switch (TODO: wire the switch into the sm70 backend).
+Attention remains SDPA/triton (no TileLang replacement scoped there yet).
+
+## What runs (training side, same venv)
+
+- torchtitan Qwen3-0.6B one fwd+bwd step fp32+fp16: PASS.
+- CPU pytest subset (17 files): 87 passed.
 
 ## Reproduce
 
 ```bash
-# clean (gated) failure:
-bash /data00/meshy/env/sm70_sglang_smoke.sh          # -> "SGLang only supports sm75 and above"
-# patched diagnostics: backup then neutralise the gate in load_model_utils.py
-# and replace _load_architecture_specific_ops() with a lazy dummy in
-# sgl_kernel/__init__.py; rerun -> model loads, forward dies at flashinfer RMSNorm.
-# Backups taken during diagnosis: *.orig-sm70diag (already restored).
+# serve + full acceptance (correctness, tok/s, release/resume):
+bash /data00/meshy/env/sm70_accept.sh                    # torch_native
+ATTENTION_BACKEND=triton PORT=30121 bash sm70_accept.sh  # triton
+# minimal Paris smoke:
+bash /data00/meshy/env/sm70_sglang_patched.sh
+# operator profile:
+/data00/meshy/venv/bin/python scripts/sm70_op_bench.py 4096
 ```
+

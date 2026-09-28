@@ -195,10 +195,13 @@ def sm70_server_defaults() -> dict:
     """
     return {
         "dtype": "float16",
-        "attention_backend": "torch_native",
+        # triton beats torch_native SDPA on V100: ~20 vs ~16 tok/s single,
+        # ~601 vs ~60 agg tok/s at batch 64 (measured 2026-09-28, Qwen3-0.6B).
+        "attention_backend": "triton",
         "sampling_backend": "pytorch",
         "cuda_graph_backend_decode": "disabled",
         "cuda_graph_backend_prefill": "disabled",
+        "enable_weights_cpu_backup": True,
     }
 
 
