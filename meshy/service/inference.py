@@ -36,6 +36,26 @@ _TORCHRUN_ENV_KEYS = (
 )
 
 
+def _sm70_active() -> bool:
+    """True when serving on an NVIDIA sm70 (V100) GPU needing the compat patch."""
+    if os.environ.get("MESHY_SGLANG_SM70") == "0":
+        return False
+    try:
+        import torch
+
+        return torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (7, 0)
+    except Exception:
+        return False
+
+
+def _sm70_child_env(env: dict[str, str]) -> None:
+    from meshy.backend.sglang_sm70 import bootstrap_pythonpath
+
+    env["MESHY_SGLANG_SM70"] = "1"
+    boot = bootstrap_pythonpath()
+    env["PYTHONPATH"] = os.pathsep.join([boot, env["PYTHONPATH"]]) if env.get("PYTHONPATH") else boot
+
+
 def _augment_path(env: dict[str, str]) -> None:
     extra = [os.path.dirname(sys.executable)]
     cuda_home = (
@@ -186,6 +206,8 @@ class SGLangService(Service):
         env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         for key in _TORCHRUN_ENV_KEYS:
             env.pop(key, None)
+        if _sm70_active():
+            _sm70_child_env(env)
         _augment_path(env)
         return env
 
@@ -202,6 +224,11 @@ class SGLangService(Service):
         args = dict(self.server_args)
         if self.model_path is not None:
             args.setdefault("model_path", self.model_path)
+        if _sm70_active():
+            from meshy.backend.sglang_sm70 import sm70_server_defaults
+
+            for key, value in sm70_server_defaults().items():
+                args.setdefault(key, value)
         args.update({"host": self.bind_host, "port": self.endpoint_port, "tp_size": len(self.replica_gpus)})
         if len(by_node) > 1:
             args.update({
