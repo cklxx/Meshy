@@ -82,9 +82,32 @@ from meshy.config import (
     TrainerParamsConfig,
     TrainingServiceConfig,
 )
+from meshy.dataset.gsm8k import GSM8K
 from meshy.service.base import ServiceGroup
 from meshy.service.colocation import ColocationRing, SchedulingMode
 from meshy.service.ignite import Ignitor
+
+
+class BoundedGSM8K(GSM8K):
+    """:class:`GSM8K` that serves exactly ``RL_STEPS`` prompt batches.
+
+    The stock dataset only signals end when its rows run out; 7473 train rows
+    give ~934 batches per epoch, so a short run would overshoot the LR
+    scheduler horizon. Mirroring ``recipe.justrl_smoke.SmokeMATH``, this stops
+    the rollout (and hence the run) at the configured step count. The bound is
+    per dataset *instance*, and the worker rebuilds the dataset every epoch,
+    so the recipe pins ``num_epochs=1``: the bound is the total run length.
+    """
+
+    def __init__(self, batch_size: int, seed: int | None = None, **kwargs):
+        super().__init__(batch_size=batch_size, seed=seed, **kwargs)
+        self._batches_left = RL_STEPS
+
+    def next_batch(self, builder):
+        if self._batches_left <= 0:
+            return []
+        self._batches_left -= 1
+        return super().next_batch(builder)
 
 MODEL_PATH = os.environ.get("XRL_MODEL", "/data00/meshy/models/Qwen3-0.6B")
 MODEL_NAME = os.environ.get("XRL_MODEL_NAME", "qwen3")
@@ -103,6 +126,19 @@ ROLLOUT_DIR = os.environ.get("XRL_ROLLOUT_DIR", os.path.join(STORAGE_ROOT, "roll
 ROLLOUT_BATCH = int(os.environ.get("XRL_ROLLOUT_BATCH", "8"))  # prompts per step
 GROUP_SIZE = int(os.environ.get("XRL_GROUP_SIZE", "8"))  # completions per prompt
 BATCH_SIZE = ROLLOUT_BATCH * GROUP_SIZE  # trainer trigger threshold: 64
+# Outer RL updates. Two things are keyed to this number:
+#  1. the LR scheduler horizon (``TrainerConfig.steps``) — one
+#     ``lr_scheduler.step()`` per *outer* train_step (the mini-batches inside
+#     it only call ``optimizer.step``; the scheduler call is gated by
+#     ``step_schedule=True``, which fires once per 64-sample TQ batch);
+#  2. the rollout length — :class:`BoundedGSM8K` returns exactly this many
+#     prompt batches, so the run ends at the scheduler horizon instead of
+#     overrunning it (the framework otherwise stops only on dataset
+#     exhaustion; with lr_decay_ratio=0 the scheduler asserts on the first
+#     step past ``steps`` — stable_steps == steps+1).
+RL_STEPS = int(os.environ.get("XRL_STEPS", "1000"))
+# GradScaler/LR proof: 8 epochs x 7473 train rows / 8 prompts = ~7473
+# possible batches; the bound below is what actually stops the run.
 
 # fp32 master weights + fp16 FSDP compute + dynamic loss scaling (the sm70
 # default). XRL_TRAIN_DTYPE=float16 is uniform-fp16 storage: ~2 GiB cheaper
@@ -121,7 +157,7 @@ def _trainer_config() -> TrainerConfig:
         model_name=MODEL_NAME,
         model_flavor=MODEL_FLAVOR,
         seq_len=SEQ_LEN,
-        steps=int(os.environ.get("XRL_STEPS", "1000")),
+        steps=RL_STEPS,
         dtype=TRAIN_DTYPE,
         mixed_precision_param=TRAIN_MIXED_PARAM,
         lr=float(os.environ.get("XRL_LR", "1e-6")),
@@ -188,7 +224,7 @@ def _rollout_group() -> ServiceGroup:
         wait_until=["actor_train", "actor_infer"],
         config=RolloutServiceConfig(
             model_path=MODEL_PATH,
-            dataset="meshy.dataset.gsm8k:GSM8K",
+            dataset="recipe.grpo_gsm8k_v100:BoundedGSM8K",
             dataset_kwargs={"batch_size": ROLLOUT_BATCH, "split": "train", "seed": 42},
             reward="meshy.dataset.gsm8k:GSM8K.reward",
             sampling_params={
@@ -200,7 +236,7 @@ def _rollout_group() -> ServiceGroup:
             group_size=GROUP_SIZE,
             poll_interval=2.0,
             pacing_window=1,
-            num_epochs=int(os.environ.get("XRL_EPOCHS", "8")),
+            num_epochs=int(os.environ.get("XRL_EPOCHS", "1")),
         ),
     )
 
