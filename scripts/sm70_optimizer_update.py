@@ -212,7 +212,7 @@ def run_fsdp_fp32_fp16(flavor: str, seq: int):
         [p for p in model.parameters() if p.requires_grad],
         lr=1e-6, weight_decay=0.1, betas=(0.9, 0.999), eps=1e-8,
     )
-    scaler = torch.cuda.amp.GradScaler(init_scale=128.0, growth_interval=100)
+    scaler = torch.cuda.amp.GradScaler()
     ids = torch.randint(0, spec.model.vocab_size, (1, seq), device="cuda:0")
     tgt = torch.randint(0, spec.model.vocab_size, (1, seq), device="cuda:0")
 
@@ -234,11 +234,12 @@ def run_fsdp_fp32_fp16(flavor: str, seq: int):
     for _ in range(8):
         before_flat = {n: p.detach().clone() for n, p in model.named_parameters()}
         opt.zero_grad()
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            z = model(ids)
-            loss = torch.nn.functional.cross_entropy(
-                z.float().reshape(-1, z.size(-1)), tgt.reshape(-1)
-            )
+        # No autocast: Meshy's train_context only enters loss_parallel; fp16
+        # comes solely from FSDP unsharding params into param_dtype.
+        z = model(ids)
+        loss = torch.nn.functional.cross_entropy(
+            z.float().reshape(-1, z.size(-1)), tgt.reshape(-1)
+        )
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -249,10 +250,8 @@ def run_fsdp_fp32_fp16(flavor: str, seq: int):
             break
         skipped += 1
 
-    # Probe again after training: storage dtype outside forward vs the dtype
-    # the leaf matmul sees while the FSDP unit is unsharded.
     seen.clear()
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+    with torch.no_grad():
         model(ids)
     storage = {str(p.dtype).replace("torch.", "") for p in model.parameters()}
     out = measure_flat(model, before_flat)
