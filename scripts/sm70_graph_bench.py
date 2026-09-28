@@ -60,7 +60,8 @@ def wait_ready(port: int, proc, timeout: float = 1800.0) -> None:
     raise TimeoutError("server not ready in time")
 
 
-def start_server(model: str, port: int, graph: str, max_bs: int, log: str):
+def start_server(model: str, port: int, graph: str, max_bs: int, log: str,
+                 mem_fraction: float = 0.6):
     env = os.environ.copy()
     env["MESHY_SGLANG_SM70"] = "1"
     env["MESHY_SM70_TILELANG"] = env.get("MESHY_SM70_TILELANG", "1")
@@ -79,7 +80,7 @@ def start_server(model: str, port: int, graph: str, max_bs: int, log: str):
     args = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", model, "--host", "127.0.0.1", "--port", str(port),
-        "--tp-size", "1",
+        "--tp-size", "1", "--mem-fraction-static", str(mem_fraction),
     ]
     for key, value in sm70_server_defaults(
         cuda_graph=(graph == "on"), max_bs=max_bs

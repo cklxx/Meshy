@@ -104,6 +104,17 @@ Measured Qwen3-0.6B fp16: 20.1 tok/s single, 601 agg tok/s batch 64; release
 28.4GB -> 1.7GB and generation stays correct after resume. Mechanism, op
 profile and both-backend comparison: [v100_sm70_failures.md](v100_sm70_failures.md).
 
+**Pitfall: verification scripts must pass production-identical server params.**
+The colocate hand-off only works with `--enable-memory-saver`; without it
+`/release_memory_occupation` is a no-op that still returns HTTP 200 in ~10 ms,
+and a script that forgets the flag measures "release frees ~20 MiB" — a
+measurement artifact, not a graph/allocator bug. Same for
+`--mem-fraction-static` (production 0.60): capture/release behavior changes
+with the fraction. Every sm70 check/bench script builds its argv from
+`sm70_server_defaults()` (the same function `SGLangService` uses) plus the
+recipe's `mem_fraction_static`, instead of hand-listing flags, so script and
+production cannot drift. Mirror `recipe/grpo_gsm8k_v100.py`'s `server_args`.
+
 ## What does run
 
 - SGLang Qwen3-0.6B fp16 generate (triton / torch_native), release/resume: PASS.

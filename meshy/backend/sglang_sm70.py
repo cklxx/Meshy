@@ -290,21 +290,28 @@ def apply_sm70_patch() -> bool:
     return True
 
 
-def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None = None) -> dict:
+def sm70_server_defaults(
+    *,
+    cuda_graph: bool | None = None,
+    max_bs: int | None = None,
+    saver_manages_graph: bool | None = None,
+) -> dict:
     """SGLang server flags required on sm70 (caller values win).
 
     fp16, triton attention (the one backend that does not force-disable CUDA
-    graph), pytorch sampling. CUDA graph is enabled for decode by default up to
-    ``MESHY_SM70_CUDA_GRAPH_MAX_BS`` (64): sm70 capture has to be verified at
-    runtime and prefill graph stays off (variable-shape prefill is where the
-    tileRL capture-poisoning failure occurred). Set MESHY_SM70_CUDA_GRAPH=0 to
-    force eager for A/B timing. Memory saver keeps a host weight backup so
-    release/resume restores real weights.
+    graph), pytorch sampling, and the torch memory saver enabled (required for
+    the colocate GPU hand-off). CUDA graph is enabled for decode by default up
+    to ``MESHY_SM70_CUDA_GRAPH_MAX_BS`` (64); prefill graph stays off. Set
+    MESHY_SM70_CUDA_GRAPH=0 to force eager for A/B timing.
 
-    Explicit ``cuda_graph`` / ``max_bs`` kwargs win over the environment, so a
-    parent building CLI args for a child need not mutate its own os.environ
-    (mutating only the child env previously made every A/B server come up
-    graph-on, because defaults were read in the parent).
+    ``saver_manages_graph`` (default False; MESHY_SM70_SAVER_MANAGES_GRAPH=1)
+    opts in to registering the graph capture pool with the memory saver
+    (SGLANG_MEMORY_SAVER_CUDA_GRAPH). That branch is unverified on sm70 and only
+    reclaims the ~1 GB graph pool on release, so it stays off unless measured
+    to be needed.
+
+    Explicit kwargs win over the environment, so a parent building CLI args for
+    a child need not mutate its own os.environ.
     """
     import os
 
@@ -312,6 +319,8 @@ def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None =
         cuda_graph = os.environ.get("MESHY_SM70_CUDA_GRAPH", "1") != "0"
     if max_bs is None:
         max_bs = int(os.environ.get("MESHY_SM70_CUDA_GRAPH_MAX_BS", "64"))
+    if saver_manages_graph is None:
+        saver_manages_graph = os.environ.get("MESHY_SM70_SAVER_MANAGES_GRAPH", "0") == "1"
     graph_on = cuda_graph
     defaults = {
         "dtype": "float16",
@@ -319,13 +328,16 @@ def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None =
         # torch_native forces graph disabled upstream.
         "attention_backend": "triton",
         "sampling_backend": "pytorch",
+        # Colocate release/resume depends on the torch memory saver being on;
+        # without it /release_memory_occupation is a no-op that still 200s.
+        "enable_memory_saver": True,
         "enable_weights_cpu_backup": True,
     }
     if graph_on:
         # Keep SGLang's default padded capture-bs bucket list (1,2,4,..,max_bs):
-        # that is ~12 graphs up to bs=64 and fits the ~3 GB capture budget.
-        # Do NOT set --disable-cuda-graph-padding, which switches to a
-        # per-concrete-bs list (1..64 = 64 graphs) and OOMs the capture pool.
+        # that is ~12 graphs up to bs=64 and fits the capture budget. Do NOT set
+        # --disable-cuda-graph-padding, which switches to a per-concrete-bs list
+        # (1..64 = 64 graphs) and OOMs the capture pool.
         defaults.update(
             {
                 "cuda_graph_backend_decode": "full",
@@ -333,6 +345,10 @@ def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None =
                 "cuda_graph_max_bs_decode": max_bs,
             }
         )
+        if saver_manages_graph:
+            # Opt-in only (unverified on sm70): put the graph pool inside a
+            # memory-saver region so release(cuda_graph) can suspend it.
+            os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
     else:
         # disable_cuda_graph (deprecated, == backend decode+prefill disabled)
         # is the explicit, greppable eager switch; pass it as a store_true flag.
@@ -344,6 +360,35 @@ def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None =
             }
         )
     return defaults
+
+
+def release_tags() -> tuple[str, ...]:
+    """Memory tags a colocate release must pause on sm70.
+
+    The ``cuda_graph`` tag is included only when the graph pool was registered
+    with the torch memory saver (``MESHY_SM70_SAVER_MANAGES_GRAPH=1``); by
+    default the ~1 GB graph pool stays pinned across release and resume.
+    """
+    tags = ["kv_cache", "weights"]
+    try:
+        import os
+
+        d = sm70_server_defaults()
+    except Exception:
+        return ("kv_cache", "weights")
+    if d.get("cuda_graph_backend_decode") == "full" and os.environ.get(
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH", ""
+    ) == "1":
+        tags.append("cuda_graph")
+    # Pause order inside SGLang is kv_cache, weights, cuda_graph; emit in that.
+    return tuple(t for t in ("kv_cache", "weights", "cuda_graph") if t in tags)
+
+
+def resume_tags() -> tuple[str, ...]:
+    """Resume order mirrors SGLang's: cuda_graph, weights, then kv_cache."""
+    tags = release_tags()
+    order = {"cuda_graph": 0, "weights": 1, "kv_cache": 2}
+    return tuple(sorted(tags, key=order.get))
 
 
 def bootstrap_pythonpath() -> str | None:

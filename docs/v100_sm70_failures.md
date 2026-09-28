@@ -52,40 +52,63 @@ Memory saver requires `--enable-weights-cpu-backup`: without it released
 weights have no host copy and resume runs on garbage (token 0 / "!!!!"). Resume
 is asynchronous; a caller must poll until output is correct.
 
-## TileLang fused ops + CUDA graph (2026-09-28 evening)
+## TileLang fused ops + CUDA graph (2026-09-28)
 
 With kern's TileLang rmsnorm/fused_add_rmsnorm/silu_and_mul enabled
-(`MESHY_SM70_TILELANG=1`, v100/kern 8bf97c4) **and** decode CUDA graph enabled
-(`scripts/sm70_graph_bench.py`, `--cuda-graph-backend-decode full
---cuda-graph-max-bs-decode 64`, triton attn, fp16):
+(`MESHY_SM70_TILELANG=1`, v100/kern 8bf97c4) **and** decode CUDA graph
+(`--cuda-graph-backend-decode full --cuda-graph-max-bs-decode 64`, triton, fp16):
 
-| mode | single tok/s | batch-64 agg tok/s |
-|---|---|---|
-| graph off (run 1) | 201.14 | 3318.45 |
-| graph off (run 2, swapped order) | 199.68 | 3312.85 |
-| graph on  (run 1) | 200.37 | 3307.82 |
-| graph on  (run 2, swapped order) | 202.99 | 3316.28 |
+* graph captures cleanly on sm70: 12 padded buckets `[1,2,4,8,12,16,24,32,40,
+  48,56,64]`, ~24-84 s, ~1.0 GB of the ~3 GB post-KV-pool budget;
+* decode replays the graph (`cuda graph: True` in scheduler logs), greedy
+  output is token-for-token identical to eager.
 
-Greedy output is token-for-token identical across all four runs (graph on vs
-off), and after release/resume (31594 -> 31576 MiB) generation is still correct
-(Paris). Scheduler logs confirm decode replays the graph (`cuda graph: True`).
+> **Release/resume numbers previously listed here (31594 -> 31576 MiB) are
+> invalid.** Those check servers were started without `--enable-memory-saver`,
+> so `/release_memory_occupation` was a no-op (HTTP 200 in ~10 ms, ~20 MiB
+> freed) and measured nothing about the graph pool. The valid three-mode
+> comparison (saver on, mem_fraction 0.6) is in the section below.
 
-**CUDA graph works on sm70 but gives no additional speedup here.** It captures
-cleanly (12 padded buckets 1..64, ~84 s) and replays correctly, but once the
-TileLang kernels remove the elementwise CPU-launch overhead, each decode step is
-bound by the serial attention dependency (the next token cannot be issued until
-attention finishes), which graph launch batching cannot remove. So graph is kept
-available/verified but not the perf lever; the ~10x jump over the earlier
-native-only numbers (20 -> ~200 single, 601 -> ~3310 batch) is from TileLang +
-the hot two-run measurement, not from graph.
+CUDA graph is the **main decode speedup**, ~8x (kern's same-config eager
+numbers: ~25 tok/s single, ~1436 batch-64; graph: ~208 single, ~3310 batch-64).
+An earlier A/B run in this file reported "no gain" but was invalid: the off
+switch did not propagate to the server, so all four servers came up graph-on
+(`cuda_graph_backend_decode='full'`, `cuda graph: True` in every log). Fixed by
+passing the on/off choice as an explicit `sm70_server_defaults(cuda_graph=...)`
+kwarg instead of a child-only env var; graph-off now sends
+`--disable-cuda-graph` (regression: tests/test_sm70_server_defaults.py).
 
-Capture gotcha: do **not** pass `--disable-cuda-graph-padding`. SGLang's
-default padded bucket list (`[1,2,4,8,12,16,24,32,40,48,56,64]`, 12 graphs)
-fits the ~3 GB post-KV-pool budget; that flag instead makes it capture one
-graph per concrete bs 1..64 (64 graphs) and OOMs at capture end
-(`cudaErrorMemoryAllocation`). The sm70 patch uses the padded default.
-Prefill graph stays off (variable-shape prefill is where the tileRL capture-
-poisoning failure occurred; decode-only is what serves decode latency).
+Capture failure mode (important for colocate release/resume): passing
+`--disable-cuda-graph-padding` switches capture to one graph per concrete bs
+1..64 (64 graphs) and fails at capture end with `cudaErrorMemoryAllocation`.
+In SGLang 0.5.18 that exception propagates out of `init_cuda_graphs` and
+**kills the scheduler process** — it does NOT fall back to eager and does not
+call `empty_cache`, so the tileRL-style `captures_underway`-poisons-allocator
+assertion is not reached in-process; the process simply dies (clean fail-fast,
+but fatal for a colocate step). The patch therefore always uses the padded
+bucket list and never the per-bs flag. Production must guarantee the capture
+succeeds once (mem_fraction 0.6 check below); there is no in-process retry.
+
+Prefill graph stays off (variable-shape prefill is where the tileRL
+capture-poisoning failure occurred; decode-only is what serves decode latency).
+
+### mem_fraction_static 0.6 (colocate) — capture once, release/resume safe
+
+Measured 2026-09-28 (`scripts/sm70_graph_t1f_check.py`) at the production
+colocate fraction 0.6 with graph + TileLang: decode graph captures **once,
+cleanly** (12 padded buckets, 24.3 s, 0 failure/OOM lines; post-KV-pool
+availability is 12.1 GB — more headroom than the 0.85 run's 3.1 GB, so a
+smaller fraction makes capture easier, not harder). Single 190.9 tok/s,
+batch-64 3920.7 agg tok/s. (Capture and speed are unaffected by the
+memory-saver flag and remain valid.)
+
+**Release/resume at 0.6 — rerun pending.** The earlier "22362 -> 22342 MiB,
+Paris OK" claim came from a server without `--enable-memory-saver`; release was
+a no-op there. The corrected three-mode check (graph off / graph on / graph on
++ saver-managed graph pool), all with `--enable-memory-saver
+--mem-fraction-static 0.6`, reports per-group release-stable MiB, release/resume
+latency, post-resume `cuda graph: True`, and Paris correctness. Results land
+here after the on-card run.
 
 ## Native-op profile at Qwen3-0.6B shapes (fp16, N=4096, 200 iters)
 
