@@ -229,8 +229,9 @@ class TitanTrainer(ForgeEngine):
             # graphs dynamic after the second distinct shape, but the default
             # cache of 8 entries is too small for the bucketed shape set.
             # ``from torch import _dynamo`` (not ``import torch._dynamo``):
-            # the latter binds ``torch`` as a method-local and makes earlier
-            # references in this __init__ (the GradScaler above) unbound.
+            # the latter binds ``torch`` as a function-local, shadowing the
+            # module-level import for the whole __init__ and making the earlier
+            # GradScaler construction raise UnboundLocalError.
             from torch import _dynamo
 
             _dynamo.config.cache_size_limit = max(
