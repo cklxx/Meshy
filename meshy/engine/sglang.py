@@ -87,7 +87,11 @@ class SGLangEngine:
             max_keepalive_connections=max_connections,
         )
         timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=None)
-        self.client = httpx.AsyncClient(timeout=timeout, limits=limits)
+        # SGLang endpoints are local / in-cluster hosts. trust_env=False avoids
+        # both needless proxy use and httpx choking on IPv6 CIDRs (e.g. ::1,
+        # fe80::/10) that the login environment puts in NO_PROXY
+        # (httpx.InvalidURL: Invalid port ':').
+        self.client = httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 
     def _next_endpoint(self) -> str:
         with self._endpoint_lock:

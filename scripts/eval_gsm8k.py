@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -79,18 +80,35 @@ def wait_healthy(base_url: str, timeout_s: int = 600) -> None:
 
 
 def start_server(model: str, port: int, mem_fraction: float) -> subprocess.Popen:
+    # On sm70 (V100) SGLang 0.5.18 floors at sm75; Meshy's bootstrap patch
+    # bypasses the gate, stubs sgl_kernel, forces native fused ops and pins
+    # the CUDA 12.6 runtime. Harmless elsewhere (it no-ops off sm70).
+    import meshy.backend.sglang_sm70 as sm70
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(sm70.__file__))))
+    bootstrap = os.path.join(repo_root, "meshy", "backend", "_sm70bootstrap")
+    env = dict(os.environ, MESHY_SGLANG_SM70="1",
+               PYTHONPATH=bootstrap + os.pathsep + repo_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
     cmd = [
         sys.executable, "-m", "sglang.launch_server",
         "--model-path", model,
         "--tp-size", "1",
-        "--dtype", "half",
-        "--disable-cuda-graph",
+        "--dtype", "float16",
+        "--attention-backend", "triton",
+        "--sampling-backend", "pytorch",
+        "--cuda-graph-backend-decode", "disabled",
+        "--cuda-graph-backend-prefill", "disabled",
         "--mem-fraction-static", str(mem_fraction),
         "--port", str(port),
         "--host", "127.0.0.1",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    wait_healthy(f"http://127.0.0.1:{port}")
+    logf = open(args.server_log, "w")
+    proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
+    try:
+        wait_healthy(f"http://127.0.0.1:{port}")
+    except Exception:
+        proc.terminate()
+        raise
     return proc
 
 
@@ -108,6 +126,7 @@ def main() -> None:
     ap.add_argument("--no-thinking", action="store_true",
                     help="render the chat template with enable_thinking=False")
     ap.add_argument("--out", default=None, help="optional jsonl dump of prompt/response/prediction")
+    ap.add_argument("--server-log", default="/data00/meshy/rl/logs/eval_server.log")
     args = ap.parse_args()
 
     ds = load_dataset(args.data, "main", split="test")

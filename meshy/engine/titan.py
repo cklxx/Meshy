@@ -89,22 +89,23 @@ def _publish_weights_to_inference(
 
     def sync_one(target: dict[str, Any]) -> None:
         endpoint = str(target["endpoint"]).rstrip("/")
-        response = httpx.post(
-            f"{endpoint}/update_weights_from_disk",
-            json={"model_path": weights_path},
-            timeout=1800.0,
-        )
-        response.raise_for_status()
-        # Drop HiCache L3 on the replica: L3 keys are token-only and survive
-        # SGLang's radix flush, so stale old-policy KV would otherwise be read
-        # under the new weights. 404 means the replica has no L3 backend.
-        try:
-            httpx.post(
-                f"{endpoint}/clear_hicache_storage_backend", timeout=300.0
+        # In-cluster endpoint: no proxy, and trust_env=False also dodges httpx
+        # failing on IPv6 CIDRs in NO_PROXY (::1, fe80::/10).
+        with httpx.Client(timeout=1800.0, trust_env=False) as client:
+            client.post(
+                f"{endpoint}/update_weights_from_disk",
+                json={"model_path": weights_path},
             ).raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 404:
-                raise
+            # Drop HiCache L3 on the replica: L3 keys are token-only and survive
+            # SGLang's radix flush, so stale old-policy KV would otherwise be read
+            # under the new weights. 404 means the replica has no L3 backend.
+            try:
+                client.post(
+                    f"{endpoint}/clear_hicache_storage_backend", timeout=300.0
+                ).raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 404:
+                    raise
 
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
         futures = [pool.submit(sync_one, target) for target in targets]
