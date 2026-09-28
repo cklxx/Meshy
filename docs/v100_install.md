@@ -76,7 +76,15 @@ Verify arch support without initialising the device:
 $PY -c "import torch; assert 'sm_70' in torch.cuda.get_arch_list(); print(torch.__version__, torch.version.cuda)"
 ```
 
-## Serving on the V100
+## Serving on the V100 — BLOCKED upstream (sm75 floor)
+
+SGLang 0.5.18 **does not start on sm70**, independent of flags. Three layers
+each require sm75+: SGLang's own gate
+(`maybe_downgrade_dtype_for_legacy_gpu`, "SGLang only supports sm75 and above"),
+sglang-kernel (no sm70 wheel in any published version, no sdist), and
+FlashInfer ("requires GPUs with sm75 or higher"). Downgrading SGLang does not
+avoid it. The intended command once the kernel stack has an sm70 path (kern's
+TileLang replacement) is:
 
 ```bash
 $PY -m sglang.launch_server \
@@ -85,3 +93,11 @@ $PY -m sglang.launch_server \
     --attention-backend triton \
     --dtype float16
 ```
+
+Full tracebacks and the hot-path operator list: [v100_sm70_failures.md](v100_sm70_failures.md).
+
+## What does run
+
+- torchtitan Qwen3-0.6B one fwd+bwd step in fp32 and fp16: PASS.
+- CPU pytest subset (17 files): 87 passed.
+
