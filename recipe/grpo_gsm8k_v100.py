@@ -17,9 +17,13 @@ sm70 constraints baked in:
 * attention/sampling backends are triton/pytorch: flashinfer prebuilt wheels
   ship sm75+ cubins only and sgl-kernel ships sm80+ only, so the default
   flashinfer attention/sampling paths cannot launch on V100;
-* CUDA graphs are disabled for the engine: sm70 graph capture failure has
-  been observed to poison the caching allocator; launch latency is irrelevant
-  at one engine;
+* decode CUDA graph is on by sm70 default (``sm70_server_defaults``): the
+  triton backend supports it on sm70 and measured decode goes 25 -> 208
+  tok/s single-stream, 1436 -> 3310 at batch 64; prefill graph stays off
+  (variable-shape capture is the path that poisoned the allocator). Only
+  the decode graph adds ~3 GiB of capture pool; release/resume of the
+  memory saver is verified with capture present (sm70 T1f check).
+  ``MESHY_SM70_CUDA_GRAPH=0`` forces eager;
 * ``compile_model=False``: inductor on sm70 buys little and risks sm-specific
   codegen.
 
@@ -32,8 +36,8 @@ intermediate 3072, vocab 151936)
 GPU, rollout phase (trainer offloaded):
   SGLang static pool  mem_fraction 0.60   19.2  GiB  (weights sit inside it)
     ├─ engine weights  fp16               1.11 GiB
-    ├─ runtime/workspaces, no graphs      ~2    GiB
-    └─ KV pool                            ~16   GiB
+    ├─ runtime/workspaces + decode graph capture (~3 GiB)  ~5   GiB
+    └─ KV pool                            ~13   GiB
   dynamic (torch allocator outside pool)  ~2    GiB
   ----------------------------------------------
   used                                 ~21 GiB of 32, headroom ~11
@@ -212,11 +216,12 @@ def _inference_config() -> InferenceServiceConfig:
             # See module docstring: 19.2 GiB static pool on the rollout card.
             "mem_fraction_static": float(os.environ.get("XRL_MEM_FRACTION", "0.60")),
             # sm70: fp16 weights/KV, triton attention (flashinfer cubins are
-            # sm75+), pytorch sampling (sgl-kernel ops are sm80+), no graphs.
+            # sm75+), pytorch sampling (sgl-kernel ops are sm80+). Decode
+            # CUDA graph comes from sm70_server_defaults (on; MESHY_SM70_CUDA_GRAPH=0
+            # forces eager); do not pin disable_cuda_graph here.
             "dtype": "half",
             "attention_backend": "triton",
             "sampling_backend": "pytorch",
-            "disable_cuda_graph": True,
         },
     )
 
