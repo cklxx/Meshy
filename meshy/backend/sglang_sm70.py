@@ -290,7 +290,7 @@ def apply_sm70_patch() -> bool:
     return True
 
 
-def sm70_server_defaults() -> dict:
+def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None = None) -> dict:
     """SGLang server flags required on sm70 (caller values win).
 
     fp16, triton attention (the one backend that does not force-disable CUDA
@@ -300,11 +300,19 @@ def sm70_server_defaults() -> dict:
     tileRL capture-poisoning failure occurred). Set MESHY_SM70_CUDA_GRAPH=0 to
     force eager for A/B timing. Memory saver keeps a host weight backup so
     release/resume restores real weights.
+
+    Explicit ``cuda_graph`` / ``max_bs`` kwargs win over the environment, so a
+    parent building CLI args for a child need not mutate its own os.environ
+    (mutating only the child env previously made every A/B server come up
+    graph-on, because defaults were read in the parent).
     """
     import os
 
-    graph_on = os.environ.get("MESHY_SM70_CUDA_GRAPH", "1") != "0"
-    max_bs = int(os.environ.get("MESHY_SM70_CUDA_GRAPH_MAX_BS", "64"))
+    if cuda_graph is None:
+        cuda_graph = os.environ.get("MESHY_SM70_CUDA_GRAPH", "1") != "0"
+    if max_bs is None:
+        max_bs = int(os.environ.get("MESHY_SM70_CUDA_GRAPH_MAX_BS", "64"))
+    graph_on = cuda_graph
     defaults = {
         "dtype": "float16",
         # triton is both the fastest measured backend and graph-compatible;
@@ -326,8 +334,11 @@ def sm70_server_defaults() -> dict:
             }
         )
     else:
+        # disable_cuda_graph (deprecated, == backend decode+prefill disabled)
+        # is the explicit, greppable eager switch; pass it as a store_true flag.
         defaults.update(
             {
+                "disable_cuda_graph": True,
                 "cuda_graph_backend_decode": "disabled",
                 "cuda_graph_backend_prefill": "disabled",
             }

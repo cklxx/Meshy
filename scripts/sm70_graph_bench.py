@@ -81,7 +81,9 @@ def start_server(model: str, port: int, graph: str, max_bs: int, log: str):
         "--model-path", model, "--host", "127.0.0.1", "--port", str(port),
         "--tp-size", "1",
     ]
-    for key, value in sm70_server_defaults().items():
+    for key, value in sm70_server_defaults(
+        cuda_graph=(graph == "on"), max_bs=max_bs
+    ).items():
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
             if value:
