@@ -204,7 +204,6 @@ def _trainer_params() -> TrainerParamsConfig:
     params = dict(
         mini_batch_size=int(os.environ.get("XRL_MINI_BATCH", "8")),
         micro_batch_size=1,
-        seq_bucket=1024,
         ppo_clip_eps_low=0.2,
         ppo_clip_eps_high=0.28,
         old_logprobs_source="train",
@@ -212,6 +211,11 @@ def _trainer_params() -> TrainerParamsConfig:
     if mtpm:
         params["batch_layout"] = "padded"
         params["max_tokens_per_micro"] = int(mtpm)
+    # seq_bucket sets the padded row-length alignment (resolve_align =
+    # lcm(bucket, tp*cp*2)). compile_model=False and no train CUDA graph mean
+    # nothing specializes on it, so 64 is free on sm70 and removes most
+    # single-row padding; 1024 is the conservative default.
+    params["seq_bucket"] = int(os.environ.get("XRL_SEQ_BUCKET", "1024"))
     return TrainerParamsConfig(**params)
 
 

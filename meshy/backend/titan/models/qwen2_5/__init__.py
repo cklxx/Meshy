@@ -115,7 +115,14 @@ def _attention_config(backend: str):
     """
     match backend:
         case "sdpa":
-            return ScaledDotProductAttention.Config(), "causal"
+            from meshy.backend.titan.models.attention import (
+                Sm70ScaledDotProductAttention,
+            )
+
+            # On sm70 torchtitan's [cudnn, flash, math] order lands on the
+            # O(seq^2) MATH kernel; the subclass inserts mem-efficient first.
+            # On other capabilities its backend list equals torchtitan's.
+            return Sm70ScaledDotProductAttention.Config(), "causal"
         case "flex":
             return FlexAttention.Config(), "block_causal"
         case "flex_flash":
