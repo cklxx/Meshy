@@ -52,6 +52,41 @@ Memory saver requires `--enable-weights-cpu-backup`: without it released
 weights have no host copy and resume runs on garbage (token 0 / "!!!!"). Resume
 is asynchronous; a caller must poll until output is correct.
 
+## TileLang fused ops + CUDA graph (2026-09-28 evening)
+
+With kern's TileLang rmsnorm/fused_add_rmsnorm/silu_and_mul enabled
+(`MESHY_SM70_TILELANG=1`, v100/kern 8bf97c4) **and** decode CUDA graph enabled
+(`scripts/sm70_graph_bench.py`, `--cuda-graph-backend-decode full
+--cuda-graph-max-bs-decode 64`, triton attn, fp16):
+
+| mode | single tok/s | batch-64 agg tok/s |
+|---|---|---|
+| graph off (run 1) | 201.14 | 3318.45 |
+| graph off (run 2, swapped order) | 199.68 | 3312.85 |
+| graph on  (run 1) | 200.37 | 3307.82 |
+| graph on  (run 2, swapped order) | 202.99 | 3316.28 |
+
+Greedy output is token-for-token identical across all four runs (graph on vs
+off), and after release/resume (31594 -> 31576 MiB) generation is still correct
+(Paris). Scheduler logs confirm decode replays the graph (`cuda graph: True`).
+
+**CUDA graph works on sm70 but gives no additional speedup here.** It captures
+cleanly (12 padded buckets 1..64, ~84 s) and replays correctly, but once the
+TileLang kernels remove the elementwise CPU-launch overhead, each decode step is
+bound by the serial attention dependency (the next token cannot be issued until
+attention finishes), which graph launch batching cannot remove. So graph is kept
+available/verified but not the perf lever; the ~10x jump over the earlier
+native-only numbers (20 -> ~200 single, 601 -> ~3310 batch) is from TileLang +
+the hot two-run measurement, not from graph.
+
+Capture gotcha: do **not** pass `--disable-cuda-graph-padding`. SGLang's
+default padded bucket list (`[1,2,4,8,12,16,24,32,40,48,56,64]`, 12 graphs)
+fits the ~3 GB post-KV-pool budget; that flag instead makes it capture one
+graph per concrete bs 1..64 (64 graphs) and OOMs at capture end
+(`cudaErrorMemoryAllocation`). The sm70 patch uses the padded default.
+Prefill graph stays off (variable-shape prefill is where the tileRL capture-
+poisoning failure occurred; decode-only is what serves decode latency).
+
 ## Native-op profile at Qwen3-0.6B shapes (fp16, N=4096, 200 iters)
 
 Microbenchmark `scripts/sm70_op_bench.py`: per-call ms and share of the listed

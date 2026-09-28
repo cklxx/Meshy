@@ -314,12 +314,15 @@ def sm70_server_defaults() -> dict:
         "enable_weights_cpu_backup": True,
     }
     if graph_on:
+        # Keep SGLang's default padded capture-bs bucket list (1,2,4,..,max_bs):
+        # that is ~12 graphs up to bs=64 and fits the ~3 GB capture budget.
+        # Do NOT set --disable-cuda-graph-padding, which switches to a
+        # per-concrete-bs list (1..64 = 64 graphs) and OOMs the capture pool.
         defaults.update(
             {
                 "cuda_graph_backend_decode": "full",
                 "cuda_graph_backend_prefill": "disabled",
                 "cuda_graph_max_bs_decode": max_bs,
-                "disable_cuda_graph_padding": True,
             }
         )
     else:
