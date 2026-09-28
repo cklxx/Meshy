@@ -63,6 +63,15 @@ def _wait_exit(proc, timeout=_TIMEOUT_S) -> int:
     return proc.exitcode
 
 
+def _wait_key(key: str, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if bootstrap.check([key]):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def test_on_tq_fatal_terminates_process_nonzero() -> None:
     ctx = multiprocessing.get_context("spawn")
     addr = _start_store()
@@ -70,8 +79,9 @@ def test_on_tq_fatal_terminates_process_nonzero() -> None:
     proc.start()
     code = _wait_exit(proc)
     assert code != 0, f"fatal worker exited cleanly ({code}); should be non-zero"
-    # The fatal cause must reach the shared store.
-    assert bootstrap.check([f"fatal|/tmp/failfast-runtime"])
+    # The fatal cause must reach the shared store (poll: the child self-terminates
+    # via SIGTERM right after the set, so visibility can lag the exit slightly).
+    assert _wait_key("fatal|/tmp/failfast-runtime")
 
 
 def test_passive_ignitor_exits_on_fatal_marker() -> None:
@@ -86,3 +96,57 @@ def test_passive_ignitor_exits_on_fatal_marker() -> None:
     )
     code = _wait_exit(proc)
     assert code == 1, f"passive ignitor should os._exit(1), got {code}"
+
+
+# ── clean completion (T6c) ─────────────────────────────────────────────────
+
+def _ignitor_done_child(addr: str) -> None:
+    os.environ["XRL_BOOTSTRAP_ADDR"] = addr
+    os.environ["XRL_RUNTIME_DIR"] = "/tmp/done-runtime"
+    os.environ["XRL_DONE_SOURCES"] = "rollout,titan"
+    from meshy.service.ignite import Ignitor
+
+    Ignitor([]).join()  # passive rank; must os._exit(0) once all sources done
+    os._exit(1)
+
+
+def test_done_requires_all_sources_then_exits_zero(monkeypatch) -> None:
+    """One done source alone must not end the run; once both rollout and titan
+    report, the passive ignitor exits 0 within seconds (regression: post-run
+    hang holding the GPUs)."""
+    monkeypatch.setenv("XRL_RUNTIME_DIR", "/tmp/done-runtime")
+    ctx = multiprocessing.get_context("spawn")
+    addr = _start_store()
+    proc = ctx.Process(target=_ignitor_done_child, args=(addr,))
+    proc.start()
+    time.sleep(2.0)  # enter watch
+
+    from meshy.service import failfast
+
+    # Rollout exhausted but the trainer has not published its final step: the
+    # run must stay alive (done needs both sources).
+    failfast.publish_done("rollout")
+    proc.join(3.0)
+    assert proc.is_alive(), "ignitor exited with only the rollout done marker"
+
+    failfast.publish_done("titan")
+    code = _wait_exit(proc)
+    assert code == 0, f"passive ignitor should os._exit(0) on completion, got {code}"
+
+
+def test_done_gate_ignores_fatal_order_and_counts_sources() -> None:
+    """Unit-level: done_published is False until every configured source set."""
+    from meshy.service import failfast
+
+    addr = _start_store()
+    os.environ["XRL_BOOTSTRAP_ADDR"] = addr
+    os.environ["XRL_RUNTIME_DIR"] = "/tmp/done-unit-runtime"
+    os.environ["XRL_DONE_SOURCES"] = "a,b"
+    try:
+        assert failfast.done_published() is False
+        failfast.publish_done("a")
+        assert failfast.done_published() is False
+        failfast.publish_done("b")
+        assert failfast.done_published() is True
+    finally:
+        os.environ.pop("XRL_DONE_SOURCES", None)

@@ -53,6 +53,28 @@ def build_config(
     return import_tq().build_config(endpoints_ref, base_conf)
 
 
+def _clamp_tq_threads() -> None:
+    """Cap TQ's worker threads to physical cores unless explicitly overridden.
+
+    Upstream defaults TQ_NUM_THREADS=8 and warns on every call when that
+    exceeds the physical core count (e.g. an 8-vCPU / 4-core box), which floods
+    the log in an idle poll loop. Respect a user-set value; otherwise clamp to
+    psutil's physical count, falling back to os.cpu_count() and finally 1.
+    """
+    if os.environ.get("TQ_NUM_THREADS"):
+        return
+    cores: int | None = None
+    try:
+        import psutil
+
+        cores = psutil.cpu_count(logical=False)
+    except Exception:
+        cores = None
+    if not cores:
+        cores = os.cpu_count() or 1
+    os.environ["TQ_NUM_THREADS"] = str(max(1, int(cores)))
+
+
 def connect(
     endpoints_ref: str, base_conf: "dict | DictConfig | None" = None
 ) -> "TransferQueueClient":
@@ -65,6 +87,7 @@ def connect(
     storage units over ZMQ. Each process should hold exactly one client; the
     client owns a background event loop and a set of ZMQ sockets.
     """
+    _clamp_tq_threads()
     if is_store_ref(endpoints_ref):
         return import_tq().connect_endpoints(
             _fetch_store_endpoints(endpoints_ref), base_conf, source=endpoints_ref

@@ -514,6 +514,7 @@ class RolloutWorker(TQWorker):
             dataset = self.dataset_factory(**self.dataset_kwargs)
             budget = self._oversample_budget(getattr(dataset, "n_prompts", None))
             filtered_at_epoch_start = self.groups_filtered
+            exhausted = False
             while not self.stopped:
                 prompts = dataset.next_batch(builder)
                 if not prompts:
@@ -524,6 +525,7 @@ class RolloutWorker(TQWorker):
                         self.groups_filtered,
                         self.groups_seen,
                     )
+                    exhausted = True
                     break
                 if budget is not None:
                     spent = self.groups_filtered - filtered_at_epoch_start
@@ -535,6 +537,7 @@ class RolloutWorker(TQWorker):
                             spent,
                             budget,
                         )
+                        exhausted = True
                         break
                 for prompt in prompts:
                     version = await self.acquire_generation_slot(self.group_size)
@@ -543,8 +546,18 @@ class RolloutWorker(TQWorker):
                     task = asyncio.create_task(execute(prompt, version))
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
-        if tasks:
-            await asyncio.gather(*tasks)
+            if tasks:
+                # Let every in-flight group finish and land in TQ before we say
+                # the producer side is done, so the trainer cannot see a
+                # half-written final window.
+                await asyncio.gather(*tasks)
+            if exhausted:
+                from meshy.service.failfast import publish_done
+
+                logger.info("RolloutWorker finished all {} epoch(s); publishing done",
+                            self.num_epochs)
+                publish_done("rollout")
+                break
 
 
 __all__ = [

@@ -236,19 +236,20 @@ class Ignitor:
         if not procs:
             # Passive / idle ranks (e.g. non-master inference cards, or cards
             # not used by this pass) keep the torchrun group uniform by idling,
-            # but they must still exit fast when a sibling rank fails.
-            from meshy.service.failfast import watch_for_fatal
+            # but they must still exit fast when a sibling rank finishes/fails.
+            from meshy.service.failfast import watch_for_completion
 
-            cause = watch_for_fatal(lambda: None)
-            if cause is not None:
+            done, cause = watch_for_completion(lambda: None)
+            if done:
+                self._finish_clean()
+            else:
                 self._fail_fast(cause)
             return
 
-        from meshy.service.failfast import watch_for_fatal
+        from meshy.service.failfast import watch_for_completion
 
-        # Fails fast on either a run-wide fatal marker or a local engine child
-        # exiting on its own (worker self-terminates via SIGTERM on fatal; any
-        # other unexpected exit must also tear the group down, not hang).
+        # Exit on either clean completion (dataset exhausted + trainer's final
+        # step published) or a fatal/local child exit.
         def _local_failure() -> str | None:
             for service in self.services:
                 for p in service.processes:
@@ -256,12 +257,25 @@ class Ignitor:
                         return f"service {service.name!r} process exited with code {p.exitcode}"
             return None
 
-        cause = watch_for_fatal(_local_failure)
-        if cause is None:
-            for p in procs:
-                p.join()
+        done, cause = watch_for_completion(_local_failure)
+        if done:
+            self._finish_clean()
             return
         self._fail_fast(cause)
+
+    def _finish_clean(self) -> None:
+        """Tear services down and exit 0 after a clean completion.
+
+        Engine command loops and TQ client threads are non-daemonic / blocking,
+        so like the fatal path we hard-exit after terminating children; the
+        bootstrap done marker makes every rank reach this together.
+        """
+        logger.info("Run completed cleanly; terminating services")
+        if int(os.environ.get("RANK", "0")) == 0:
+            print("[ignitor] run completed", flush=True)
+        for service in self.services:
+            self._hard_terminate_service(service)
+        os._exit(0)
 
     def _fail_fast(self, cause: str) -> None:
         """Terminate every local service and exit non-zero on the first fatal.

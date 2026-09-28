@@ -133,7 +133,22 @@ class TitanWorker(TQWorker):
                 payload_ref=weights_path,
             )
             self._colocation_request = None
-        return self._gate_output(step=step)
+        gate = self._gate_output(step=step)
+        self._maybe_publish_done(step)
+        return gate
+
+    def _maybe_publish_done(self, step: int) -> None:
+        """After the configured final step (weights already published), signal
+        clean completion so the group exits once the rollout is also exhausted."""
+        total = int(getattr(getattr(self.engine, "trainer_config", None), "steps", 0) or 0)
+        if total > 0 and int(step) >= total:
+            from meshy.service.failfast import publish_done
+
+            logger.info(
+                "Titan {} reached final step {}/{}; publishing done",
+                getattr(self.engine, "name", "titan"), step, total,
+            )
+            publish_done("titan")
 
 
 __all__ = ["TitanWorker"]
