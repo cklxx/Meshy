@@ -293,15 +293,45 @@ class SGLangEngine:
     def load_weights(self, model_path: str) -> None:
         self._management("POST", "/update_weights_from_disk", json={"model_path": model_path}, timeout=1800.0)
 
+    def _sm70_colocate_tags(self) -> tuple[str, ...] | None:
+        """Release tags that also pause the CUDA-graph pool on sm70, else None.
+
+        On V100 the decode graph pool is registered with the torch memory saver;
+        omitting its tag leaves ~1 GB pinned after release and OOMs the colocate
+        trainer. On any other GPU this returns None and the standard
+        (kv_cache, weights) tags are used.
+        """
+        try:
+            import torch
+
+            if not (torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (7, 0)):
+                return None
+            from meshy.backend.sglang_sm70 import release_tags
+
+            return release_tags()
+        except Exception:
+            return None
+
     def release_for_colocate(self) -> None:
         self.pause_generation()
         self.wait_until_idle()
-        self.release_memory(("kv_cache", "weights"))
+        tags = self._sm70_colocate_tags() or ("kv_cache", "weights")
+        self.release_memory(tags)
 
     def restore_for_colocate(self, weights_path: str) -> None:
-        self.resume_memory(("weights",))
-        self.load_weights(weights_path)
-        self.resume_memory(("kv_cache",))
+        tags = self._sm70_colocate_tags()
+        if tags is None:
+            self.resume_memory(("weights",))
+            self.load_weights(weights_path)
+            self.resume_memory(("kv_cache",))
+        else:
+            # sm70 graph resume: graph, weights, kv_cache order; weights load
+            # after the weights region is resumed (as in the standard path).
+            if "cuda_graph" in tags:
+                self.resume_memory(("cuda_graph",))
+            self.resume_memory(("weights",))
+            self.load_weights(weights_path)
+            self.resume_memory(("kv_cache",))
         self.continue_generation()
 
     def on_colocate_release(self, target: str) -> None:

@@ -333,6 +333,12 @@ def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None =
                 "cuda_graph_max_bs_decode": max_bs,
             }
         )
+        # Register the graph capture pool with the torch memory saver so a
+        # colocate release can pause GPU_MEMORY_TYPE_CUDA_GRAPH. Without this the
+        # graphs live in torch's private global graph pool, invisible to the
+        # saver: release(kv_cache,weights) frees almost nothing (measured ~20
+        # MiB vs ~27 GB graph-off), so the trainer cannot take the card.
+        os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1"
     else:
         # disable_cuda_graph (deprecated, == backend decode+prefill disabled)
         # is the explicit, greppable eager switch; pass it as a store_true flag.
@@ -344,6 +350,32 @@ def sm70_server_defaults(*, cuda_graph: bool | None = None, max_bs: int | None =
             }
         )
     return defaults
+
+
+def release_tags() -> tuple[str, ...]:
+    """Memory tags a colocate release must pause on sm70.
+
+    When decode CUDA graph is enabled the graph pool is registered with the
+    torch memory saver (``SGLANG_MEMORY_SAVER_CUDA_GRAPH=1``), so its
+    ``cuda_graph`` tag has to be released alongside weights/kv_cache or the ~1 GB
+    graph pool stays pinned and the trainer cannot take the card.
+    """
+    tags = ["kv_cache", "weights"]
+    try:
+        graph_on = sm70_server_defaults().get("cuda_graph_backend_decode") == "full"
+    except Exception:
+        graph_on = False
+    if graph_on:
+        tags.append("cuda_graph")
+    # Pause order inside SGLang is kv_cache, weights, cuda_graph; emit in that.
+    return tuple(t for t in ("kv_cache", "weights", "cuda_graph") if t in tags)
+
+
+def resume_tags() -> tuple[str, ...]:
+    """Resume order mirrors SGLang's: cuda_graph, weights, then kv_cache."""
+    tags = release_tags()
+    order = {"cuda_graph": 0, "weights": 1, "kv_cache": 2}
+    return tuple(sorted(tags, key=order.get))
 
 
 def bootstrap_pythonpath() -> str | None:

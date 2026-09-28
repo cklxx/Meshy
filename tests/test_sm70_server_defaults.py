@@ -68,3 +68,20 @@ def test_explicit_kwargs_override_parent_env(defaults_module, monkeypatch) -> No
     on = defaults_module.sm70_server_defaults(cuda_graph=True, max_bs=32)
     assert on["cuda_graph_max_bs_decode"] == 32
     assert on["cuda_graph_backend_decode"] == "full"
+
+
+def test_release_tags_include_cuda_graph_when_graph_on(defaults_module, monkeypatch) -> None:
+    monkeypatch.setenv("MESHY_SM70_CUDA_GRAPH", "1")
+    rel = defaults_module.release_tags()
+    res = defaults_module.resume_tags()
+    assert "cuda_graph" in rel
+    assert tuple(rel) == ("kv_cache", "weights", "cuda_graph")
+    # resume order: graph before weights before kv_cache
+    assert tuple(res) == ("cuda_graph", "weights", "kv_cache")
+
+
+def test_release_tags_skip_cuda_graph_when_graph_off(defaults_module, monkeypatch) -> None:
+    monkeypatch.setenv("MESHY_SM70_CUDA_GRAPH", "0")
+    assert "cuda_graph" not in defaults_module.release_tags()
+    assert tuple(defaults_module.release_tags()) == ("kv_cache", "weights")
+    assert tuple(defaults_module.resume_tags()) == ("weights", "kv_cache")

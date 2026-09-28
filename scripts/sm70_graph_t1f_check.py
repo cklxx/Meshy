@@ -104,6 +104,22 @@ def mem():
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]).decode().strip())
 
 
+def wait_mem_settle(stop=60.0, stable_for=3.0):
+    """Poll nvidia-smi until used-memory stops changing (release is async)."""
+    t0 = time.time()
+    last, stable_since = mem(), time.time()
+    trace = [last]
+    while time.time() - t0 < stop:
+        time.sleep(1.0)
+        cur = mem()
+        trace.append(cur)
+        if cur != last:
+            last, stable_since = cur, time.time()
+        elif time.time() - stable_since >= stable_for:
+            return cur, trace
+    return last, trace
+
+
 report = {}
 
 # ---- 1. graph ON at mem_fraction 0.6 ----
@@ -119,9 +135,15 @@ try:
     s1, t1 = timed(port, 1)
     b1, _ = timed(port, 64)
     before = mem()
+    # Release ALL three tags including cuda_graph (the T1g fix). Release is
+    # async: poll nvidia-smi to a stable value instead of sleeping blindly.
     requests.post(f"http://127.0.0.1:{port}/release_memory_occupation",
-                  json={"tags": ["kv_cache", "weights"]}, timeout=120).raise_for_status()
-    time.sleep(3); rel = mem()
+                  json={"tags": ["kv_cache", "weights", "cuda_graph"]}, timeout=120).raise_for_status()
+    rel, trace = wait_mem_settle(stop=60)
+    # Resume in graph,weights,kv order; graph memory is suspended/resumed (not
+    # recaptured) by torch_memory_saver.
+    requests.post(f"http://127.0.0.1:{port}/resume_memory_occupation",
+                  json={"tags": ["cuda_graph"]}, timeout=300).raise_for_status()
     requests.post(f"http://127.0.0.1:{port}/resume_memory_occupation",
                   json={"tags": ["weights"]}, timeout=300).raise_for_status()
     requests.post(f"http://127.0.0.1:{port}/resume_memory_occupation",
@@ -132,14 +154,25 @@ try:
         if "Paris" in after:
             break
         time.sleep(2)
+    # Confirm decode still replays the (resumed) graph after the cycle.
+    time.sleep(1)
+    gen(port, 1, 8)
+    time.sleep(1)
+    graph_log = subprocess.run(["tail", "-200", log], capture_output=True, text=True).stdout
+    graph_after_resume = "cuda graph: True" in graph_log
+    recapture = len([l for l in graph_log.splitlines() if "Capture target decode CUDA graph begin" in l])
     report["graph_on_0.6"] = {
         "capture_success_lines": cap, "capture_failure_lines": fails,
         "single_tok_s": s1, "batch64_tok_s": b1, "greedy": t1,
-        "mem_before": before, "mem_after_release": rel,
+        "mem_before": before, "mem_after_release_settled": rel,
+        "mem_release_trace_mib": trace,
+        "released_mib": before - rel,
         "after_resume": after, "paris_ok": "Paris" in after,
+        "decode_replays_graph_after_resume": graph_after_resume,
+        "capture_begin_count": recapture,
         "capture_once_ok": cap == "1" and fails == "0",
     }
-    print(json.dumps(report["graph_on_0.6"], indent=1)[:700], flush=True)
+    print(json.dumps(report["graph_on_0.6"], indent=1)[:1100], flush=True)
 finally:
     try: os.killpg(os.getpgid(p.pid), signal.SIGTERM); p.wait(60)
     except Exception: pass
