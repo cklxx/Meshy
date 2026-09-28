@@ -112,7 +112,11 @@ class CriticEngine:
         with (
             torch.device("meta"),
             tools_utils.set_default_dtype(
-                torch.bfloat16 if training.dtype == "bfloat16" else torch.float32
+                {
+                    "bfloat16": torch.bfloat16,
+                    "float16": torch.float16,
+                    "float32": torch.float32,
+                }[training.dtype]
             ),
         ):
             model = critic_cfg.build()
@@ -153,6 +157,10 @@ class CriticEngine:
             for p in model.value_head.parameters():
                 p.requires_grad = True
 
+        # fp16 compute (FSDP mixed_precision_param) needs dynamic loss scaling.
+        self.grad_scaler = torch.cuda.amp.GradScaler(
+            enabled=training.mixed_precision_param == "float16"
+        )
         # Critic-only optimiser over whatever is trainable.
         trainable = [p for p in model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(trainable, lr=lr)
@@ -508,7 +516,7 @@ class CriticEngine:
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite critic loss: {loss.item()}")
                 local_numerator = local_numerator + numerator.detach().float()
-                loss.backward()
+                self.grad_scaler.scale(loss).backward()
             if collect_values:
                 # Back to temporal order before it leaves the engine: the CP
                 # shard is a head-tail permutation, so a caller slicing row
@@ -518,8 +526,10 @@ class CriticEngine:
 
         # The cold-start value-loss spike is large (recipe §2 reports a peak
         # around 32); an unclipped step on it moves the head a long way.
+        self.grad_scaler.unscale_(self.optimizer)
         self.clip_grad_norm()
-        self.optimizer.step()
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
 
         global_numerator = self._global_sum(local_numerator)
         return float((global_numerator / denom).detach()), collected
