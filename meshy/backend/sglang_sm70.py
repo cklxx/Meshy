@@ -202,6 +202,10 @@ def _install_tilelang_fused_ops(*, prewarm: bool = True) -> None:
             eps = float(self.variance_epsilon)
             if self.variance_size_override is not None:
                 return orig(self, x, residual, post_residual_addition)
+            # Kernels are fp16-only; rl_on_policy_target uses fp32 weights /
+            # override_orig_dtype and must stay on the native path.
+            if self.weight.data.dtype != torch.float16 or x.dtype != torch.float16:
+                return orig(self, x, residual, post_residual_addition)
             if residual is None:
                 try:
                     out = _tl.rmsnorm(x, self.weight.data, eps)
@@ -210,6 +214,8 @@ def _install_tilelang_fused_ops(*, prewarm: bool = True) -> None:
                 if x.dim() != 2:
                     out = out.reshape(x.shape)
                 return out
+            if residual.dtype != torch.float16:
+                return orig(self, x, residual, post_residual_addition)
             try:
                 _tl.fused_add_rmsnorm(
                     x, residual, self.weight.data, eps
