@@ -130,8 +130,13 @@ def build_forge_config(
             # checkpoints with perfectly valid-looking keys/shapes.
             # ``trainer.enable_checkpoint`` keeps its user-facing meaning
             # (persist DCP checkpoints during training); the initial load is
-            # enabled independently of it.
+            # enabled independently of it. When an HF path forces ``enable``
+            # but the user left DCP saves off, mark the manager ``load_only``:
+            # torchtitan's ``_should_save`` returns False under load_only while
+            # ``load`` still runs, so a warm start no longer persists DCP
+            # checkpoints against ``XRL_ENABLE_DCP_CKPT=0``.
             enable=trainer.enable_checkpoint or bool(hf_model_path),
+            load_only=bool(hf_model_path) and not trainer.enable_checkpoint,
             # This is TorchTitan's native DCP resume directory. It is
             # intentionally independent from XRL_CHECKPOINT_DIR, which is
             # reserved for exported HF weights consumed by inference.
