@@ -92,10 +92,20 @@ def test_eval_versions_with_offset(monkeypatch):
     # Warm-started at cumulative window 3: new version N == window N+3.
     # Eval cumulative windows 6,12,...,36 -> new versions 3,9,...,33.
     monkeypatch.setattr(inloop, "EVAL_OFFSET", 3)
+    monkeypatch.setattr(inloop, "EVAL_FIRST_CUM", 6)
     monkeypatch.setattr(inloop, "EVAL_EVERY", 6)
-    hits = [v for v in range(38)
-            if v >= inloop.EVAL_OFFSET and (v - inloop.EVAL_OFFSET) % inloop.EVAL_EVERY == 0]
+    hits = [v for v in range(38) if inloop._is_eval_version(v)]
     assert hits == [3, 9, 15, 21, 27, 33]
+
+
+def test_eval_versions_first_version_below_offset(monkeypatch):
+    # cont24: version N == cumulative window N+16; first eval cumulative
+    # window 18 -> first eval VERSION is 2 (< offset 16). Must hit 2,8,14,20.
+    monkeypatch.setattr(inloop, "EVAL_OFFSET", 16)
+    monkeypatch.setattr(inloop, "EVAL_FIRST_CUM", 18)
+    monkeypatch.setattr(inloop, "EVAL_EVERY", 6)
+    hits = [v for v in range(24) if inloop._is_eval_version(v)]
+    assert hits == [2, 8, 14, 20]
 
 
 def test_eval_versions_no_offset(monkeypatch):

@@ -31,15 +31,22 @@ SYSTEM_PROMPT = "You are a helpful assistant."
 SUFFIX = ' Let\'s think step by step and output the final answer after "####".'
 
 EVAL_EVERY = int(os.environ.get("XRL_EVAL_EVERY", "50"))
-# First version to evaluate, then every EVAL_EVERY. Needed for warm-started
-# runs whose version N corresponds to cumulative window N+OFFSET (e.g. a run
-# started from old window 3: new version 0 == cumulative window 3, so eval at
-# new versions 3,9,15,... to land on cumulative windows 6,12,18,...).
+# Cumulative-window alignment. version N of this run == cumulative window
+# N+EVAL_OFFSET. Evals fire on cumulative windows EVAL_FIRST_CUM,
+# FIRST+EVERY, ... . Expressing the gate on the *cumulative* window (rather
+# than on version) is what lets the first eval version be below the offset
+# (e.g. cont24: offset 16, first cumulative 18 -> eval at version 2,8,...).
 EVAL_OFFSET = int(os.environ.get("XRL_EVAL_OFFSET", "0"))
+EVAL_FIRST_CUM = int(os.environ.get("XRL_EVAL_FIRST_CUM", str(EVAL_OFFSET)))
 EVAL_N = int(os.environ.get("XRL_EVAL_N", "200"))
 KEEP_VERSIONS = int(os.environ.get("XRL_KEEP_VERSIONS", "3"))
 MAX_NEW_TOKENS = int(os.environ.get("XRL_EVAL_MAX_NEW", "4096"))
 EVAL_CONCURRENCY = int(os.environ.get("XRL_EVAL_CONCURRENCY", "64"))
+
+
+def _is_eval_version(version: int) -> bool:
+    cum = version + EVAL_OFFSET
+    return cum >= EVAL_FIRST_CUM and (cum - EVAL_FIRST_CUM) % EVAL_EVERY == 0
 
 _SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": MAX_NEW_TOKENS}
 
@@ -163,7 +170,7 @@ async def version_hook(*, version: int, engine, model_path: str, **_: object) ->
     """200x1 holdout + milestone copy + old-version prune, once per version."""
     root = _runtime_root()
 
-    if version >= EVAL_OFFSET and (version - EVAL_OFFSET) % EVAL_EVERY == 0:
+    if _is_eval_version(version):
         summary = await _holdout_eval(engine, model_path, root, version)
         print(f"[inloop-eval v{version}] {json.dumps(summary)}", flush=True)
         src = os.path.join(_weights_dir(root), f"v{version}")
