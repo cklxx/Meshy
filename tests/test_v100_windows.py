@@ -172,6 +172,42 @@ def test_plan_default_start_zero(monkeypatch, tmp_path):
     assert plan.batches_this_run == 14
 
 
+def test_resume_inference_boots_from_restored_step_hf(monkeypatch, tmp_path):
+    # DCP step-10 + exported weights/actor_train-0/v10 present -> inference
+    # must boot from v10, not the base model.
+    ck = tmp_path / "ck" / "grpo_gsm8k_v100" / "r4" / "checkpoint" / "step-10"
+    ck.mkdir(parents=True)
+    (ck / ".metadata").write_text("x")
+    rt = tmp_path / "run"
+    v10 = rt / "weights" / "actor_train-0" / "v10"
+    v10.mkdir(parents=True)
+    (v10 / "model.safetensors").write_bytes(b"w")
+    monkeypatch.setenv("XRL_CKPT_DIR", str(tmp_path / "ck"))
+    monkeypatch.setenv("XRL_RUN_TAG", "r4")
+    monkeypatch.setenv("XRL_RUNTIME_DIR", str(rt))
+    base = "/models/Qwen3-0.6B"
+    assert v100_windows.resume_inference_model_path(base) == str(v10)
+
+
+def test_resume_inference_falls_back_without_hf_export(monkeypatch, tmp_path):
+    ck = tmp_path / "ck" / "grpo_gsm8k_v100" / "r5" / "checkpoint" / "step-10"
+    ck.mkdir(parents=True)
+    (ck / ".metadata").write_text("x")
+    monkeypatch.setenv("XRL_CKPT_DIR", str(tmp_path / "ck"))
+    monkeypatch.setenv("XRL_RUN_TAG", "r5")
+    monkeypatch.setenv("XRL_RUNTIME_DIR", str(tmp_path / "run"))  # no weights dir
+    base = "/models/Qwen3-0.6B"
+    assert v100_windows.resume_inference_model_path(base) == base
+
+
+def test_resume_inference_base_on_cold_start(monkeypatch, tmp_path):
+    monkeypatch.setenv("XRL_CKPT_DIR", str(tmp_path / "ck"))
+    monkeypatch.setenv("XRL_RUN_TAG", "r6")
+    monkeypatch.setenv("XRL_RUNTIME_DIR", str(tmp_path / "run"))
+    base = "/models/Qwen3-0.6B"
+    assert v100_windows.resume_inference_model_path(base) == base
+
+
 # ---------- BoundedGSM8K end to end (only where recipe imports) -------------
 
 def test_bounded_gsm8k_seek_and_bound(monkeypatch):

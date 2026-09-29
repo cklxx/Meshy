@@ -104,3 +104,27 @@ def resolve_eval_offset() -> int:
     return 0 if dcp_step is not None else int(
         os.environ.get("XRL_START_WINDOW", "0")
     )
+
+
+def resume_inference_model_path(base_path: str) -> str:
+    """HF weights the inference engine must boot from on a DCP resume.
+
+    On a DCP resume the trainer restores model *and* optimizer from
+    ``step-N``, but a freshly started SGLang would otherwise boot from the
+    configured base model and the genesis GPU grant carries no checkpoint, so
+    it generates the first window with base weights labelled version N
+    (off-policy, mis-versioned). Booting inference from the matching exported
+    HF dir ``weights/actor_train-0/vN`` makes genesis weights equal the
+    restored trainer step. Returns ``base_path`` on a cold start or when the
+    export is missing.
+    """
+    step = latest_dcp_step()
+    if step is None:
+        return base_path
+    runtime = os.environ.get("XRL_RUNTIME_DIR", "")
+    if not runtime:
+        return base_path
+    weights = os.path.join(runtime, "weights", "actor_train-0", f"v{step}")
+    if os.path.isfile(os.path.join(weights, "model.safetensors")):
+        return weights
+    return base_path
