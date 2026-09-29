@@ -60,3 +60,33 @@ def test_fp16_export_cuts_bytes_roughly_half():
     hf_export_to_fp16(sd)
     n_fp16 = sd["w"].numel() * 2
     assert n_fp16 == n_fp32 // 2
+
+
+def _rss_mib() -> int:
+    with open("/proc/self/statm") as f:
+        pages = int(f.read().split()[1])
+    return pages * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+
+
+def test_release_idle_host_memory_returns_to_baseline():
+    """After gather(fp16) -> drop -> gc -> malloc_trim, RSS must return to
+    within 100 MiB of the pre-gather baseline. Linux/proc only; skipped on mac.
+    """
+    import pytest
+
+    if not os.path.exists("/proc/self/statm"):
+        pytest.skip("proc/statm RSS check is Linux-only")
+    from meshy.backend.titan.trainer import release_idle_host_memory
+
+    n_tensors, per = 200, 4_000_000  # ~800M params fp32 = 3.2 GB transient
+    baseline = _rss_mib()
+    sd = {f"t{i}": torch.randn(per, dtype=torch.float32) for i in range(n_tensors)}
+    at_gather = _rss_mib()
+    assert at_gather - baseline > 1500  # sanity: gather actually used >1.5 GiB
+    hf_export_to_fp16(sd)
+    del sd
+    release_idle_host_memory()
+    after = _rss_mib()
+    assert after - baseline <= 100, (
+        f"RSS did not return: baseline {baseline} gather {at_gather} after {after}"
+    )

@@ -56,6 +56,37 @@ from .plan import (
 )
 
 
+def _mem_available_mib() -> int:
+    """Host MemAvailable in MiB (0 if unreadable). For OOM diagnostics."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return -1
+
+
+def release_idle_host_memory() -> None:
+    """Return freed glibc heap blocks to the OS after a large CPU buffer dies.
+
+    The fp32/fp16 HF gather is a multi-GB transient. ``del`` + ``gc.collect``
+    drops the tensors, but glibc keeps the freed arena pages resident unless
+    ``malloc_trim`` hands them back; otherwise that memory overlaps the next
+    ``offload_to_cpu`` and the 31 GiB host OOM-kills the process (observed).
+    Must run *before* offloading the model + optimizer back to CPU.
+    """
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+
+
 def hf_export_to_fp16(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -407,7 +438,10 @@ class TitanTrainer(ForgeEngine):
         self._refresh_checkpointer_cache()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        logger.info("TitanTrainer: model + optimizer states offloaded to CPU.")
+        logger.info(
+            f"TitanTrainer: model + optimizer states offloaded to CPU. "
+            f"(memlog offload_done avail={_mem_available_mib()} MiB)"
+        )
 
     def offload_optimizer_to_cpu(self) -> None:
         """Park only the optimizer states on CPU, leaving the model on GPU.
@@ -1072,9 +1106,19 @@ class TitanTrainer(ForgeEngine):
 
         All ranks must call this together — the gather is a distributed
         all-gather. Only rank 0 writes files. A barrier ensures callers on
-        every rank see the files on return.
+        every rank see the files on return. The gathered CPU state dict is
+        released back to the OS before return so it cannot overlap the
+        following ``offload_to_cpu`` (host-RSS OOM mitigation).
         """
-        self.save_hf_state_dict(self.gather_hf_state_dict(cpu_offload=True), output_dir)
+        logger.info(f"memlog gather_start avail={_mem_available_mib()} MiB")
+        state_dict = self.gather_hf_state_dict(cpu_offload=True)
+        self.save_hf_state_dict(state_dict, output_dir)
+        logger.info(f"memlog save_done avail={_mem_available_mib()} MiB")
+        # Drop the multi-GB gathered CPU tensors and hand their freed pages
+        # back to the OS BEFORE the caller offloads model+optimizer to host.
+        del state_dict
+        release_idle_host_memory()
+        logger.info(f"memlog trim_done avail={_mem_available_mib()} MiB")
 
     def save_hf_state_dict(
         self, state_dict: dict[str, torch.Tensor], output_dir: str

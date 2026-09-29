@@ -15,6 +15,12 @@ export MESHY_SM70_TILELANG=1
 : "${MESHY_SM70_CUDA_GRAPH:=1}"
 export MESHY_SM70_CUDA_GRAPH
 
+# Cap glibc malloc arenas: many threads (DCP/gather/sglang) otherwise fragment
+# host RAM across dozens of arenas and don't return pages, contributing to the
+# train-window host OOM. 2 is the standard low-fragmentation setting.
+: "${MALLOC_ARENA_MAX:=2}"
+export MALLOC_ARENA_MAX
+
 # Experiment geometry (defaults: the original 300x64 run).
 : "${XRL_STEPS:=300}"
 : "${XRL_ROLLOUT_BATCH:=8}"

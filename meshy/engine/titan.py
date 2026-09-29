@@ -115,6 +115,9 @@ def _publish_weights_to_inference(
         len(targets),
         time.monotonic() - started,
     )
+    from meshy.backend.titan.trainer import _mem_available_mib
+
+    logger.info(f"memlog sglang_update_done avail={_mem_available_mib()} MiB")
 
 
 class TitanEngine(SpmdEngine):
