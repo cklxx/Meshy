@@ -56,6 +56,28 @@ from .plan import (
 )
 
 
+def hf_export_to_fp16(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Cast a gathered HF state dict to fp16 **in place**, tensor by tensor.
+
+    The inference engine loads these weights in fp16 (server arg
+    ``dtype=half``), so fp32 export precision is discarded on load anyway.
+    Exporting fp32 kept two ~full-model copies in host RAM at once during the
+    safetensors write (the fp32 gather, ~1.8 GiB for 440M params, plus the
+    serialized fp32 bytes, ~2.4 GiB), which OOM-killed the 31 GiB host at the
+    end of training windows.
+
+    Casting one tensor at a time and dropping the fp32 reference before the
+    next means only one extra tensor (not a second full copy) is live; the dict
+    converges to ~half the bytes. Non-floating tensors are left untouched.
+    """
+    for key, value in list(state_dict.items()):
+        if torch.is_floating_point(value) and value.dtype != torch.float16:
+            state_dict[key] = value.to(torch.float16)
+    return state_dict
+
+
 def _attn_backend_of(model_config: Any) -> str:
     """Name the inner-attention backend of a torchtitan decoder config."""
     try:
@@ -1062,8 +1084,9 @@ class TitanTrainer(ForgeEngine):
         Split out of :meth:`save_hf_checkpoint` so callers that already hold a
         gathered state dict can persist it without paying for a second
         all-gather. All ranks must call together
-        (the closing barrier is collective); only rank 0 touches the disk, and
-        the dict is left intact for the caller to go on using.
+        all-gather. Only rank 0 touches the disk. Floating tensors are cast to
+        fp16 in place as they are written (the inference engine loads fp16),
+        so ``state_dict`` is fp16 on return; callers must not reuse it as fp32.
         """
         import os
 
@@ -1073,7 +1096,7 @@ class TitanTrainer(ForgeEngine):
         if dist.get_rank() == 0:
             os.makedirs(output_dir, exist_ok=True)
             weight_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, weight_path)
+            save_file(hf_export_to_fp16(state_dict), weight_path)
             logger.info(f"save_hf_checkpoint: weights → {weight_path}")
             hf_src = self.config.hf_assets_path
             if hf_src:
