@@ -27,9 +27,14 @@ export MALLOC_ARENA_MAX
 : "${XRL_GROUP_SIZE:=8}"
 : "${XRL_MINI_BATCH:=8}"
 : "${XRL_EVAL_EVERY:=50}"
-: "${XRL_EVAL_OFFSET:=0}"
+# XRL_EVAL_OFFSET left unset by default: the in-loop hook derives the
+# cumulative offset from XRL_START_WINDOW (0 on a DCP resume). Set it explicitly
+# only to override that derivation (back-compat).
+: "${XRL_EVAL_OFFSET:=}"
+: "${XRL_START_WINDOW:=0}"
 : "${XRL_RUN_TAG:=formal}"
-export XRL_STEPS XRL_ROLLOUT_BATCH XRL_GROUP_SIZE XRL_MINI_BATCH XRL_EVAL_EVERY XRL_EVAL_OFFSET
+export XRL_STEPS XRL_ROLLOUT_BATCH XRL_GROUP_SIZE XRL_MINI_BATCH XRL_EVAL_EVERY XRL_START_WINDOW
+[ -n "$XRL_EVAL_OFFSET" ] && export XRL_EVAL_OFFSET
 : "${XRL_MAX_TOKENS_PER_MICRO:=}"
 export XRL_MAX_TOKENS_PER_MICRO
 

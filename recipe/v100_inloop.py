@@ -36,7 +36,14 @@ EVAL_EVERY = int(os.environ.get("XRL_EVAL_EVERY", "50"))
 # FIRST+EVERY, ... . Expressing the gate on the *cumulative* window (rather
 # than on version) is what lets the first eval version be below the offset
 # (e.g. cont24: offset 16, first cumulative 18 -> eval at version 2,8,...).
-EVAL_OFFSET = int(os.environ.get("XRL_EVAL_OFFSET", "0"))
+# The offset is normally derived from the single XRL_START_WINDOW knob (0 on a
+# DCP resume, since restored versions are already absolute); an explicit
+# XRL_EVAL_OFFSET still wins for backward compatibility.
+from recipe.v100_windows import resolve_eval_offset
+
+EVAL_OFFSET = int(
+    os.environ.get("XRL_EVAL_OFFSET", str(resolve_eval_offset()))
+)
 EVAL_FIRST_CUM = int(os.environ.get("XRL_EVAL_FIRST_CUM", str(EVAL_OFFSET)))
 EVAL_N = int(os.environ.get("XRL_EVAL_N", "200"))
 KEEP_VERSIONS = int(os.environ.get("XRL_KEEP_VERSIONS", "3"))

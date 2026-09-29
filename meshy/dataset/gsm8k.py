@@ -54,7 +54,7 @@ def lenient_gsm8k_answer(text: str) -> float | None:
 
 class GSM8K(Dataset):
 
-    def __init__(self, batch_size: int, split: str = "train", hf_kwargs: dict = {}, seed: int | None = None):
+    def __init__(self, batch_size: int, split: str = "train", hf_kwargs: dict = {}, seed: int | None = None, **kwargs):
         super().__init__(
             hf_kwargs={
                 "path": "openai/gsm8k",
@@ -63,7 +63,8 @@ class GSM8K(Dataset):
                 **hf_kwargs,
             },
             batch_size=batch_size,
-            seed=seed
+            seed=seed,
+            **kwargs,
         )
 
     def apply_chat_template(self, data: dict, builder: SampleBuilder) -> Sample:

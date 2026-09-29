@@ -94,19 +94,45 @@ from meshy.service.ignite import Ignitor
 
 
 class BoundedGSM8K(GSM8K):
-    """:class:`GSM8K` that serves exactly ``RL_STEPS`` prompt batches.
+    """:class:`GSM8K` that serves the run's slice of the prompt curriculum.
 
     The stock dataset only signals end when its rows run out; 7473 train rows
     give ~934 batches per epoch, so a short run would overshoot the LR
-    scheduler horizon. Mirroring ``recipe.justrl_smoke.SmokeMATH``, this stops
-    the rollout (and hence the run) at the configured step count. The bound is
-    per dataset *instance*, and the worker rebuilds the dataset every epoch,
-    so the recipe pins ``num_epochs=1``: the bound is the total run length.
+    scheduler horizon. This class stops the rollout (and hence the run) at the
+    configured batch count and, for hot starts, seeks to the prompt window at
+    which this run begins instead of replaying from index 0 (which earlier
+    weight-only warm starts did — see ``recipe.v100_windows``). The bound is per
+    dataset *instance*, and the worker rebuilds the dataset every epoch, so the
+    recipe pins ``num_epochs=1``: the bound is the total run length.
+
+    A batch that straddles the 7473-row epoch end reshuffles into a fresh
+    per-epoch seed (``42 + epoch``) and keeps going rather than returning []
+    and ending the run short.
     """
 
-    def __init__(self, batch_size: int, seed: int | None = None, **kwargs):
-        super().__init__(batch_size=batch_size, seed=seed, **kwargs)
-        self._batches_left = RL_STEPS
+    def __init__(
+        self,
+        batch_size: int,
+        seed: int | None = None,
+        start_window: int | None = None,
+        batches_this_run: int | None = None,
+        **kwargs,
+    ):
+        if start_window is None or batches_this_run is None:
+            plan = WINDOW_PLAN
+            start_window = plan.start_window if start_window is None else start_window
+            if batches_this_run is None:
+                batches_this_run = plan.batches_this_run
+        # One batch == one prompt window, so the global prompt offset is the
+        # starting window times prompts/batch (= ROLLOUT_BATCH).
+        super().__init__(
+            batch_size=batch_size,
+            seed=seed,
+            start_index=int(start_window) * batch_size,
+            wrap_epochs=True,
+            **kwargs,
+        )
+        self._batches_left = int(batches_this_run)
 
     def next_batch(self, builder):
         if self._batches_left <= 0:
@@ -150,6 +176,15 @@ BATCH_SIZE = ROLLOUT_BATCH * GROUP_SIZE  # trainer trigger threshold: 64
 RL_STEPS = int(os.environ.get("XRL_STEPS", "300"))
 # GradScaler/LR proof: 8 epochs x 7473 train rows / 8 prompts = ~7473
 # possible batches; the bound below is what actually stops the run.
+
+# Resolve where this run starts in the prompt curriculum once, at import
+# (rollout process). A present DCP checkpoint wins over XRL_START_WINDOW:
+# TorchTitan restores the absolute step, so data seeks to that window and the
+# run emits the remainder; an HF warm start has no DCP, so the trainer starts
+# at step 0 and emits all RL_STEPS batches from XRL_START_WINDOW.
+from recipe.v100_windows import resolve_start_window
+
+WINDOW_PLAN = resolve_start_window(RL_STEPS)
 
 # fp32 master weights + fp16 FSDP compute + dynamic loss scaling (the sm70
 # default). XRL_TRAIN_DTYPE=float16 is uniform-fp16 storage: ~2 GiB cheaper
