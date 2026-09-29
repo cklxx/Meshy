@@ -125,7 +125,11 @@ def main():
     for batch, ctx in combos:
         (q, k_pool, v_pool, block_table, seq_lens,
          kv_indptr, kv_indices) = make_inputs(batch, ctx)
+        # KV traffic only (K and V, fp16). Q/O/index traffic is tiny by
+        # comparison and NOT counted; tl_gbs is therefore the effective
+        # KV bandwidth = theoretical bytes / measured time.
         kv_bytes = batch * ctx * KVH * D * 2 * 2
+        qo_bytes = batch * H * D * 2 * 2  # Q read + O write, for reference
 
         def bw(ms):
             return round(kv_bytes / (ms / 1e3) / 1e9, 0)
@@ -137,6 +141,8 @@ def main():
                       seq_lens)
         splits = choose_splits(batch, KVH, ctx)
         row = {"batch": batch, "ctx": ctx, "splits": splits,
+               "kv_mb": round(kv_bytes / 1e6, 1),
+               "qo_mb": round(qo_bytes / 1e6, 2),
                "max_abs_err": err,
                "tl_us": round(tl_ms * 1000, 1), "tl_gbs": bw(tl_ms)}
         if args.triton:

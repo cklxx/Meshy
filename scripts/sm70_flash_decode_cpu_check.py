@@ -26,32 +26,56 @@ def choose_splits(batch, ctx, num_sm=80, blocks_per_sm=2, chunk_min=64):
 
 def mirror(q, k_flat, v_flat, indptr, indices, seq_lens, num_splits,
            chunk):
+    """Mirror the CUDA kernel: each split block cuts its chunk into 8
+    half-warp key segments, online-softmaxes each, merges the 8
+    sub-results once, then a second pass combines the KV splits."""
     m = q.shape[0]
     scale = 1.0 / math.sqrt(D)
+    HWS = 8
+
+    def seg(b, h, lo, hi):
+        kvh = h // G
+        base = int(indptr[b])
+        acc = torch.zeros(D)
+        mm, ll = -3.0e38, 0.0
+        n = int(seq_lens[b])
+        for t in range(lo, hi):
+            if t >= n:
+                continue
+            slot = int(indices[base + t])
+            s = float((q[b, h].float()
+                       * k_flat[slot, kvh].float()).sum() * scale)
+            nm = max(mm, s)
+            corr = math.exp(mm - nm) if mm > -3.0e38 else 0.0
+            p = math.exp(s - nm)
+            acc = acc * corr + p * v_flat[slot, kvh].float()
+            ll = ll * corr + p
+            mm = nm
+        return acc, mm, ll
+
+    def merge8(parts):
+        gmax = max(mm for _, mm, _ in parts)
+        denom = sum(ll * math.exp(mm - gmax)
+                    for _, mm, ll in parts if ll > 0)
+        o = sum(a * math.exp(mm - gmax)
+                for a, mm, ll in parts if ll > 0)
+        if denom <= 0:
+            return torch.zeros(D), -3.0e38
+        return o / denom, gmax + math.log(denom)
+
     po = torch.zeros(num_splits, m, H, D)
     lse = torch.full((num_splits, m, H), -3.0e38)
     for b in range(m):
-        n = int(seq_lens[b])
-        base = int(indptr[b])
         for h in range(H):
-            kvh = h // G
             for sp in range(num_splits):
-                acc = torch.zeros(D)
-                mm, ll = -3.0e38, 0.0
-                lo, hi = sp * chunk, min((sp + 1) * chunk, n)
-                for t in range(lo, hi):
-                    slot = int(indices[base + t])
-                    s = float((q[b, h].float()
-                               * k_flat[slot, kvh].float()).sum() * scale)
-                    nm = max(mm, s)
-                    corr = math.exp(mm - nm) if mm > -3.0e38 else 0.0
-                    p = math.exp(s - nm)
-                    acc = acc * corr + p * v_flat[slot, kvh].float()
-                    ll = ll * corr + p
-                    mm = nm
-                if ll > 0.0:
-                    po[sp, b, h] = acc / ll
-                    lse[sp, b, h] = mm + math.log(ll)
+                clo = sp * chunk
+                seg_len = chunk // HWS
+                parts = []
+                for u in range(HWS):
+                    parts.append(seg(b, h, clo + u * seg_len,
+                                     clo + (u + 1) * seg_len))
+                po[sp, b, h], lse[sp, b, h] = merge8(parts)
+
     out = torch.zeros(m, H, D)
     for b in range(m):
         for h in range(H):

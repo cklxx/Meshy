@@ -1,105 +1,99 @@
-"""sm70 flash-decoding paged decode attention (no tensor cores).
+"""sm70 flash-decoding paged decode attention (hand-written CUDA).
 
-Parallelism is (sequence, kv-head, KV chunk). A block owns one kv
-head's GQA group and streams a chunk of K/V once, sharing that read
-across the ``group_size`` q heads; 128 threads each hold one head_dim
-lane and do fp32 dot/FMA work. A second kernel merges chunk partials by
-log-sum-exp. KV addressing uses SGLang's flat decode metadata directly
-(``kv_indptr`` + contiguous ``kv_indices``), so this is a drop-in
-replacement shape for ``decode_attention_fwd``.
+Thin loader/launcher around ``csrc/flash_decode.cu``. Grid is
+(sequence * kv_head, split); each 128-thread block runs eight
+half-warps, each streaming its own key range with 16 B vector loads and
+in-half-warp QK shuffles (no per-key shared-memory reduction). A second
+kernel merges the KV splits by log-sum-exp.
 
-Target: raise effective decode KV bandwidth toward 400 GB/s on V100 by
-maximizing occupancy and vectorized loads rather than HMMA (the T3e
-HMMA kernel lost the long-context batch-64 cells — see
-``sm70_tl_attention.md``).
+ABI matches SGLang's triton ``decode_attention_fwd`` inputs: q
+[M,H,D], flat k/v cache [num_slots, KVH, D], ``kv_indptr`` [M+1],
+flat ``kv_indices`` and ``seq_lens`` [M].
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
-from . import _tl
-from ._flash_decode_kernel import (
-    make_flash_decode_combine,
-    make_flash_decode_partial,
-)
-
 V100_SM = 80
-# Two resident chunks per (seq, kv-head) is the occupancy target; the
-# block is light on shared memory (512 B), so occupancy is register/
-# warp-scheduler bound — keep this modest.
-_BLOCKS_PER_SM = 2
+_WARPS_PER_BLOCK = 4
+_TARGET_WARPS_PER_SM = 32
+_BLOCKS_PER_SM_TARGET = _TARGET_WARPS_PER_SM // _WARPS_PER_BLOCK  # 8
 
-_cache: dict[tuple, object] = {}
+_lib = None
 
 
-def choose_splits(batch, num_kv_heads, ctx, num_sm=V100_SM,
-                  blocks_per_sm=_BLOCKS_PER_SM, chunk_min=64):
-    """Smallest split count filling num_sm*blocks_per_sm chunks."""
+def _lib():
+    global _lib
+    if _lib is not None:
+        return _lib
+    from torch.utils.cpp_extension import load
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "csrc", "flash_decode.cu")
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda-12.4")
+    _lib = load(
+        name="meshy_flash_decode_sm70",
+        sources=[src],
+        extra_cuda_cflags=[
+            "-O3", "-gencode=arch=compute_70,code=sm_70",
+            "-std=c++17", "--use_fast_math",
+        ],
+        extra_ldflags=["-lcuda"],
+        cuda_home=cuda_home,
+        verbose=False,
+    )
+    return _lib
+
+
+def choose_splits(batch, num_kv_heads, ctx,
+                 num_sm=V100_SM, blocks_target=_BLOCKS_PER_SM_TARGET,
+                 chunk_min=64):
+    """Pick splits for >= blocks_target*num_sM resident blocks.
+
+    bs64 x 8 kv heads already yields 512 blocks (~6.4/SM, 25 warps);
+    ctx >=1k adds splits 2-4 to push in-flight loads toward 32 warps/SM.
+    """
     base = batch * num_kv_heads
-    want = num_sm * blocks_per_sm
-    if base <= 0:
-        return 1
+    want = num_sm * blocks_target
     s = max(1, math.ceil(want / base))
-    # Round chunk down toward chunk_min by capping splits at ctx/chunk.
     s = min(s, max(1, ctx // chunk_min))
     return max(1, s)
 
 
 def flash_decode_attention(q, k_cache, v_cache, kv_indptr, kv_indices,
                            seq_lens, *, sm_scale=None, num_splits=None):
-    """Flash-decoding paged decode.
-
-    q [M,H,D] fp16; k/v cache [num_slots, KVH, D] fp16 (the 4-D c128
-    pool reshaped to (-1, KVH, D)); kv_indptr [M+1] int32; kv_indices
-    flat int32 token slots (length sum(seq_lens), padded internally);
-    seq_lens [M] int32. Returns [M,H,D] fp16.
-    """
+    """Run the flash-decoding kernel; returns [M,H,D] fp16."""
     m, h, d = q.shape
     kvh = k_cache.shape[1]
-    group = h // kvh
+    assert d == 128 and h // kvh == 2
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
     max_ctx = int(seq_lens.max().item())
     if num_splits is None:
         num_splits = choose_splits(m, kvh, max_ctx)
-    # chunk_tokens is a compile-time constant per kernel; round the max
-    # context up so each split owns a whole number of tokens.
-    chunk = math.ceil(max_ctx / num_splits)
-    key = (h, kvh, d, group, chunk)
-    pair = _cache.get(key)
-    if pair is None:
-        pair = (
-            make_flash_decode_partial(_tl, h, kvh, d, group, chunk),
-            make_flash_decode_combine(_tl, h, d),
-        )
-        _cache[key] = pair
-    partial_factory, combine_factory = pair
-
-    device = q.device
-    # Pad flat indices to m * num_splits * chunk slots so a chunk's
-    # out-of-length gathers never read past the buffer (they are masked
-    # to slot 0 in the kernel).
-    total_pad = m * num_splits * chunk
-    if kv_indices.shape[0] < total_pad:
-        pad = torch.zeros(total_pad - kv_indices.shape[0],
-                          dtype=kv_indices.dtype, device=device)
-        idx = torch.cat([kv_indices, pad])
+    # chunk must cover ceil(max_ctx/splits) tokens and be a multiple of
+    # 8 half-warps.
+    chunk = max(8, math.ceil(max_ctx / num_splits / 8) * 8)
+    total_slots = m * num_splits * chunk
+    if kv_indices.shape[0] < total_slots:
+        idx = torch.cat([kv_indices,
+                         kv_indices.new_zeros(total_slots - kv_indices.shape[0])])
     else:
         idx = kv_indices
-    scale_t = torch.tensor([sm_scale], dtype=torch.float32, device=device)
     partial_out = torch.empty(
-        (num_splits, m, h, d), dtype=torch.float16, device=device)
+        (num_splits, m * kvh, 2, d), dtype=torch.float16, device=q.device)
     partial_lse = torch.empty(
-        (num_splits, m, h), dtype=torch.float32, device=device)
-    partial_factory(q.contiguous(),
-                    k_cache.contiguous(), v_cache.contiguous(),
-                    kv_indptr.to(torch.int32).contiguous(),
-                    idx.to(torch.int32).contiguous(),
-                    seq_lens.to(torch.int32).contiguous(), scale_t,
-                    partial_out, partial_lse)
-    out = torch.empty((m, h, d), dtype=torch.float16, device=device)
-    combine_factory(partial_out, partial_lse, out)
+        (num_splits, m * kvh, 2), dtype=torch.float32, device=q.device)
+    out = torch.empty((m, h, d), dtype=torch.float16, device=q.device)
+    _lib().launch_flash_decode(
+        q.contiguous(), k_cache.contiguous(), v_cache.contiguous(),
+        kv_indptr.to(torch.int32).contiguous(),
+        idx.to(torch.int32).contiguous(),
+        seq_lens.to(torch.int32).contiguous(),
+        int(num_splits), int(chunk), float(sm_scale),
+        partial_out, partial_lse, out)
     return out
