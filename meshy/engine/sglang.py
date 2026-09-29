@@ -342,12 +342,27 @@ class SGLangEngine:
             return None
 
     def release_for_colocate(self) -> None:
+        import time
+
+        t0 = time.monotonic()
         self.pause_generation()
+        t_pause = time.monotonic()
         self.wait_until_idle()
+        t_idle = time.monotonic()
         tags = self._sm70_colocate_tags() or ("kv_cache", "weights")
         self.release_memory(tags)
+        t_release = time.monotonic()
+        logger.info(
+            "SGLang release_for_colocate: pause {:.2f}s wait_idle {:.2f}s "
+            "release_memory {} {:.2f}s (total {:.2f}s)",
+            t_pause - t0, t_idle - t_pause, tags, t_release - t_idle,
+            t_release - t0,
+        )
 
     def restore_for_colocate(self, weights_path: str) -> None:
+        import time
+
+        t0 = time.monotonic()
         tags = self._sm70_colocate_tags()
         if tags is None:
             self.resume_memory(("weights",))
@@ -361,7 +376,14 @@ class SGLangEngine:
             self.resume_memory(("weights",))
             self.load_weights(weights_path)
             self.resume_memory(("kv_cache",))
+        t_weights = time.monotonic()
         self.continue_generation()
+        logger.info(
+            "SGLang restore_for_colocate: resume+load_weights {:.2f}s "
+            "continue_generation {:.2f}s (total {:.2f}s)",
+            t_weights - t0, time.monotonic() - t_weights,
+            time.monotonic() - t0,
+        )
 
     def on_colocate_release(self, target: str) -> None:
         del target

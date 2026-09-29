@@ -244,7 +244,12 @@ def _trainer_config() -> TrainerConfig:
         # 28 resident layers OOM the V100. "full" wraps each transformer
         # block; backward recomputes one block at a time (measured decision
         # for long-context recipes, see TrainerConfig docstring).
-        activation_checkpoint_mode="full",
+        # XRL_ACTIVATION_CHECKPOINT=none trades that memory for speed on a
+        # short-context run; "selective" is the intermediate fallback if the
+        # no-AC backward OOMs.
+        activation_checkpoint_mode=os.environ.get(
+            "XRL_ACTIVATION_CHECKPOINT", "full"
+        ),
     )
 
 

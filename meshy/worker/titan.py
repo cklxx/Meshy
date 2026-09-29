@@ -108,8 +108,20 @@ class TitanWorker(TQWorker):
     def process_tq_batch(self, samples: list[Any]) -> Mapping[str, Any]:
         if self.colocation is not None and self._colocation_request is None:
             request_id = f"{getattr(self.engine, 'name', 'titan')}:window:{getattr(self.engine, 'step_index', 0)}"
+            # Timing: isolate the "where did ~3 min go" hand-off gap between
+            # the trainer asking for the card and the inference engine
+            # finishing release so restore_to_gpu can start.
+            import time
+
+            t_request = time.monotonic()
             self._colocation_request = self.colocation.request_gpu(request_id=request_id)
             self.colocation.wait_for_grant(self._colocation_request)
+            logger.info(
+                "Titan {} colocation grant acquired in {:.1f}s (window {})",
+                getattr(self.engine, "name", "titan"),
+                time.monotonic() - t_request,
+                getattr(self.engine, "step_index", 0),
+            )
         self.trained_since_sync += len(samples)
         sync = not self.stream_minibatch or self.trained_since_sync >= self.batch_size
         if sync:
