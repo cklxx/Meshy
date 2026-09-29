@@ -29,6 +29,7 @@ Design summary
 
 from __future__ import annotations
 
+import gc
 from typing import Any, Literal, Sequence
 
 import torch
@@ -461,10 +462,19 @@ class TitanTrainer(ForgeEngine):
         self._move_optimizer_states("cpu")
         self._refresh_checkpointer_cache()
         torch.cuda.synchronize()
+        # Drop any cyclic-referenced tensors (e.g. large activations when AC
+        # is off) before empty_cache, else the caching allocator keeps their
+        # blocks resident and the colocated inference engine has no room to
+        # remap its weights on the train->infer hand-off.
+        gc.collect()
         torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info(self.device)
         logger.info(
             f"TitanTrainer: model + optimizer states offloaded to CPU. "
-            f"(memlog offload_done avail={_mem_available_mib()} MiB)"
+            f"(memlog offload_done avail={_mem_available_mib()} MiB "
+            f"gpu_reserved={torch.cuda.memory_reserved(self.device) // 1048576} MiB "
+            f"gpu_allocated={torch.cuda.memory_allocated(self.device) // 1048576} MiB "
+            f"gpu_free={free // 1048576} MiB/{total // 1048576} MiB)"
         )
 
     def offload_optimizer_to_cpu(self) -> None:
