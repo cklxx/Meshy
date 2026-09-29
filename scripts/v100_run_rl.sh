@@ -46,7 +46,11 @@ export PYTHONPATH=/data00/meshy/rl/meshy
 # wasted ~1.6 GiB on a 31 GiB host. TQ storage is dict-backed (measured RSS
 # ~23 MiB), so prealloc needs no shrink even at a 512-sample window.
 export XRL_TQ_STORAGE_UNITS=1
-export XRL_RUNTIME_DIR=/3fs/stage/meshy/rollout/rl-${XRL_RUN_TAG}-$(date +%Y%m%d-%H%M%S)
+# Fresh timestamped dir per run; a caller resuming from a DCP checkpoint pins
+# XRL_RUNTIME_DIR to the original run so trajectories/TB/eval keep appending
+# there and XRL_RUN_TAG points at that run's checkpoint folder.
+: "${XRL_RUNTIME_DIR:=/3fs/stage/meshy/rollout/rl-${XRL_RUN_TAG}-$(date +%Y%m%d-%H%M%S)}"
+export XRL_RUNTIME_DIR
 echo "RUNTIME=$XRL_RUNTIME_DIR"
 echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || cat DEPLOY_COMMIT 2>/dev/null || cat /data00/meshy/rl/COMMIT 2>/dev/null)"
 echo "TAG=$XRL_RUN_TAG STEPS=$XRL_STEPS ROLLOUT_BATCH=$XRL_ROLLOUT_BATCH GROUP=$XRL_GROUP_SIZE WINDOW=$((XRL_ROLLOUT_BATCH*XRL_GROUP_SIZE)) MINI_BATCH=$XRL_MINI_BATCH UPDATES/WIN=$((XRL_ROLLOUT_BATCH*XRL_GROUP_SIZE/XRL_MINI_BATCH)) EVAL_EVERY=$XRL_EVAL_EVERY"
