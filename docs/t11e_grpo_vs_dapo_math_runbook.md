@@ -8,11 +8,12 @@
 所有路径/默认值都已对齐当前 `v100/math`（含 HendrycksMATH、math_verify 判分、
 tuple 修复、空 gold 过滤）与 v100/rl 单卡 colocate 基建。
 
-> **冻结代码（v100/t11 @ origin）：`43451b9`**。含 T11i（T7 prompt 游标、T5h
+> **冻结代码（v100/t11 @ origin）：`51f81a9`**。含 T11i（T7 prompt 游标、T5h
 > fail-loud DCP、T5i slim trajectory、T11b tuple 判分修复）、T11f flash-decode
-> （`MESHY_SM70_FLASH_DECODE=1`、`XRL_DCP_CKPT_INTERVAL=3`）、`_rollout_metrics`
-> staticmethod NameError 修复，以及 T11 前置修复（DCP 目录按 recipe 解析、末尾
-> DCP 全量可 resume）与存储迁本地 `/data00/meshy/store`（3FS 退役）。冒烟部署树按
+> （`MESHY_SM70_FLASH_DECODE=1`、`XRL_DCP_CKPT_INTERVAL=3`，含 flash 接线/内核
+> 三件套的 sentinel 实证修复）、`_rollout_metrics` staticmethod NameError 修复、
+> T11 前置修复（DCP 目录按 recipe 解析、末尾 DCP 全量可 resume）与存储迁本地
+> `/data00/meshy/store`（3FS 退役）。冒烟部署树按
 > docs/sm70_flash_decode_integration.md 以 merge 方式更新到此 hash，不用 rsync。
 > partial rollout 刻意不在树上，两臂均不开。
 
@@ -404,16 +405,17 @@ v100_run_rl.sh 显式 export，并在启动前 mkdir + 可写检查）。traject
   step 3,6,…,39 共 13 份加末尾 step40。
 - 末尾份 `last_save_model_only=False`（recipe 已设），故 step40 也含优化器/LR/
   train state，可直接 resume；两臂仅末尾份改全量合计多约 8.8 GB。
-- **容量红线**：3FS 退役后 /data00 实测可用约 **130 GB**（492 GB 盘，3FS 旧
-  engine slab 仍占盘待用户定是否删；删除前不算可回收）。两臂若把里程碑 DCP
-  全留（interval=3 每臂 step 3…39 共 13 份加末尾 step40 ≈ 14 份 × 7.25 GiB，
-  两臂），约 **190 GB 远超盘**。稳态靠 `checkpoint_keep=2` 自动滚动（每臂
-  ~14.5 GB，写下一份瞬时 +7.25）；**里程碑不许全留**。
-- 中途清理口径（与 weight-retention 一致，删前先报分数表）：
-  - 每个评测点导出 HF 到 `best`/`evalckpt`、跑完评测并记录分数后，只保留最近
-    2 份可 resume DCP；更早的中间 DCP 删除。
-  - 确需留某个里程碑（如 step20）时，最多留 1 份，并在跨过下一评测点后删除
-    上一里程碑，使任一时刻 DCP 总量 ≤ 3 份/臂。
+- **容量**：3FS 旧 engine 数据（data-s1/s2/fdb）已删，/data00 实测可用
+  **244 GB**（492 GB 盘，2026-09-30）。两臂里程碑 DCP 全留（interval=3 每臂
+  step 3…39 共 13 份加末尾 step40 ≈ 14 份 × 7.25 GiB，两臂 ≈ **190 GB**）现在
+  放得下；仍按 `checkpoint_keep=2` 稳态滚动 + 中途清理执行（与 weight-retention
+  一致，删前先报分数表），不占满盘。稳态每臂 ~14.5 GB，写下一份瞬时 +7.25 GiB。
+- DCP 保留/清理口径（与 weight-retention 一致，删前先报分数表）：
+  - 默认 `checkpoint_keep=2` 自动滚动：每臂任一时刻最近 2 份可 resume DCP，
+    评测点导出的 HF 落到 `best`/`evalckpt`。
+  - 244 GB 下里程碑全留（~190 GB）放得下，允许在评测点额外保留里程碑 DCP；
+    是否全留由主控定，不需要为腾盘强制删除。若盘占用逼近巡检阈值，再按
+    “跨评测点后删上一里程碑”回收。
   - 巡检用 `deploy/3fs-v100/63_storage_watch.py`（默认根已改本地；
     `XRL_WINDOW_GB=0.3` 只盯异常增长），余量 < 一窗 exit 1。
 
