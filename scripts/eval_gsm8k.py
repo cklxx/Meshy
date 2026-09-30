@@ -45,6 +45,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from meshy.dataset.gsm8k import _extract_gsm8k_answer
+from meshy.utils.passatk import aggregate_pass_at_k
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 SUFFIX = ' Let\'s think step by step and output the final answer after "####".'
@@ -225,6 +226,12 @@ def main() -> None:
         print(f"[score-only {args.score_only}]")
         print(f"questions={n} samples/q={samples}")
         print(f"lenient accuracy (per-q mean): {acc:.4f}")
+    for k, st in sorted(aggregate_pass_at_k(
+            [(len(v), sum(v)) for v in per_q.values()]).items()):
+        print(f"pass@{k}: {st['pass_at_k']:.4f}  (over {st['problems']} problems)")
+        for k, st in sorted(aggregate_pass_at_k(
+                [(len(v), sum(v)) for v in per_q.values()]).items()):
+            print(f"pass@{k}: {st['pass_at_k']:.4f}  (over {st['problems']} problems)")
         print(f"strict accuracy: {strict_ok}/{total} = {strict_ok / total:.4f}")
         print(f"strict format rate: {strict_fmt:.4f}")
         print(f"truncation rate: {truncated}/{total} = {truncated / total:.4f}")
@@ -298,6 +305,9 @@ def main() -> None:
                      if _extract_gsm8k_answer(answer_span(resp.get("text", ""))) is not None) / total
     print(f"questions={n} samples/q={args.samples} mode={'greedy' if args.greedy else 'sample'}")
     print(f"lenient accuracy (per-q mean): {acc:.4f}")
+    for k, st in sorted(aggregate_pass_at_k(
+            [(len(v), sum(v)) for v in per_q.values()]).items()):
+        print(f"pass@{k}: {st['pass_at_k']:.4f}  (over {st['problems']} problems)")
     print(f"strict accuracy: {strict_ok}/{total} = {strict_ok / total:.4f}")
     print(f"strict format rate: {strict_fmt:.4f}")
     print(f"truncation rate: {truncated}/{total} = {truncated / total:.4f}")
