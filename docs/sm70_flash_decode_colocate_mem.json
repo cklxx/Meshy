@@ -1,0 +1,32 @@
+[
+  {
+    "flash": false,
+    "used_after_capture_mib": 22542.0,
+    "cycle1_released_mib": 3018.0,
+    "cycle1_resume_http": 200,
+    "cycle1_resume_body": "null",
+    "cycle1_resumed_mib": 22586.0,
+    "cycle1_ok": true,
+    "cycle2_released_mib": 3018.0,
+    "cycle2_resume_http": 200,
+    "cycle2_resume_body": "null",
+    "cycle2_resumed_mib": 22586.0,
+    "cycle2_ok": true,
+    "drained_mib": 0.0
+  },
+  {
+    "flash": true,
+    "used_after_capture_mib": 22578.0,
+    "cycle1_released_mib": 3054.0,
+    "cycle1_resume_http": 200,
+    "cycle1_resume_body": "null",
+    "cycle1_resumed_mib": 22622.0,
+    "cycle1_ok": true,
+    "cycle2_released_mib": 3054.0,
+    "cycle2_resume_http": 200,
+    "cycle2_resume_body": "null",
+    "cycle2_resumed_mib": 22620.0,
+    "cycle2_ok": true,
+    "drained_mib": 0.0
+  }
+]
