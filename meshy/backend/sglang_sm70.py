@@ -212,6 +212,11 @@ def _install_flash_decode_attention() -> None:
     orig = _da.decode_attention_fwd
 
     max_ctx = int(os.environ.get("MESHY_SM70_FLASH_DECODE_MAX_CTX", "4096"))
+    # Only cache plans for batch sizes inside the graph buckets; above
+    # this (eager overshoot, e.g. a 111-request queue) fall through to
+    # triton so the plans dict cannot grow without bound with runtime
+    # batch size.
+    max_batch = int(os.environ.get("MESHY_SM70_CUDA_GRAPH_MAX_BS", "64"))
     plans: dict = {}
     _sentinel = os.environ.get("MESHY_FLASH_SENTINEL")
 
@@ -255,6 +260,7 @@ def _install_flash_decode_attention() -> None:
             and xai_temperature_len == -1 and score_mod is None
             and aux_tensors is None
             and q.dim() == 3 and q.dtype == torch.float16
+            and q.shape[0] <= max_batch
             and _nhd3
             and k_buffer.shape[-1] == v_buffer.shape[-1] == q.shape[-1]
             and q.shape[-1] == _fd._HEAD_DIM
