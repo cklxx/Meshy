@@ -23,30 +23,28 @@ _WARPS_PER_BLOCK = 4
 _TARGET_WARPS_PER_SM = 32
 _BLOCKS_PER_SM_TARGET = _TARGET_WARPS_PER_SM // _WARPS_PER_BLOCK  # 8
 
-_lib = None
+_loaded = None
 
 
 def _lib():
-    global _lib
-    if _lib is not None:
-        return _lib
+    global _loaded
+    if _loaded is not None:
+        return _loaded
     from torch.utils.cpp_extension import load
 
     here = os.path.dirname(os.path.abspath(__file__))
     src = os.path.join(here, "csrc", "flash_decode.cu")
-    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda-12.4")
-    _lib = load(
+    # Caller puts /usr/local/cuda-12.4/bin on PATH (sm70 + c++17).
+    _loaded = load(
         name="meshy_flash_decode_sm70",
         sources=[src],
         extra_cuda_cflags=[
             "-O3", "-gencode=arch=compute_70,code=sm_70",
             "-std=c++17", "--use_fast_math",
         ],
-        extra_ldflags=["-lcuda"],
-        cuda_home=cuda_home,
         verbose=False,
     )
-    return _lib
+    return _loaded
 
 
 def choose_splits(batch, num_kv_heads, ctx,

@@ -16,6 +16,7 @@
 // and k/v point at the c128 pool reshaped to [num_slots, kv_heads, D].
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -245,7 +246,8 @@ void launch_flash_decode(
     torch::Tensor kv_indptr, torch::Tensor kv_indices,
     torch::Tensor seq_lens, int64_t num_splits, int64_t chunk_tokens,
     double scale, torch::Tensor partial_out, torch::Tensor partial_lse,
-    torch::Tensor out, cudaStream_t stream) {
+    torch::Tensor out) {
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int batch = q.size(0);
   const int num_q_heads = q.size(1);
   const int num_kv_heads = num_q_heads / GROUP_SIZE;
@@ -264,4 +266,8 @@ void launch_flash_decode(
       reinterpret_cast<const __half*>(partial_out.data_ptr<at::Half>()),
       partial_lse.data_ptr<float>(), (int)num_splits, batch, num_kv_heads,
       reinterpret_cast<__half*>(out.data_ptr<at::Half>()));
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("launch_flash_decode", &launch_flash_decode);
 }

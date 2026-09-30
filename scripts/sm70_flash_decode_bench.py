@@ -29,8 +29,13 @@ PAGE = 16
 
 
 def make_inputs(batch, ctx, device="cuda"):
+    return make_var_inputs(batch, [ctx] * batch, device)
+
+
+def make_var_inputs(batch, lengths, device="cuda"):
     torch.manual_seed(0)
-    pages_per_seq = math.ceil(ctx / PAGE)
+    max_ctx = max(lengths)
+    pages_per_seq = math.ceil(max_ctx / PAGE)
     num_pages = 2 + batch * pages_per_seq
     k_pool = torch.randn(num_pages, PAGE, KVH, D, device=device,
                          dtype=torch.float16) * 0.1
@@ -39,33 +44,55 @@ def make_inputs(batch, ctx, device="cuda"):
     block_table = (
         torch.arange(2, 2 + batch * pages_per_seq, device=device,
                      dtype=torch.int32).reshape(batch, pages_per_seq))
-    seq_lens = torch.full((batch,), ctx, device=device, dtype=torch.int32)
-    lengths = seq_lens.long()
+    seq_lens = torch.tensor(lengths, device=device, dtype=torch.int32)
+    lengths_l = seq_lens.long()
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
-    kv_indptr[1:] = torch.cumsum(lengths, 0)
-    tok = torch.arange(ctx, device=device)
-    per_row = block_table[:, tok // PAGE] * PAGE + tok % PAGE
-    kv_indices = per_row.reshape(-1).to(torch.int32)
+    kv_indptr[1:] = torch.cumsum(lengths_l, 0)
+    tok = torch.arange(max_ctx, device=device)
+    per_row_slots = (block_table[:, tok // PAGE] * PAGE + tok % PAGE)
+    kv_indices = torch.cat([
+        per_row_slots[b, : lengths[b]] for b in range(batch)
+    ]).to(torch.int32)
     return q, k_pool, v_pool, block_table, seq_lens, kv_indptr, kv_indices
 
 
-def ref_full(q, k_pool, v_pool, kv_indices, seq_lens):
+def realistic_lengths(batch, seed=1):
+    """Approx RL rollout distribution: mean ~1700, p95 ~3900."""
+    g = torch.Generator().manual_seed(seed)
+    u = torch.rand(batch, generator=g)
+    lo = torch.where(u < 0.75, torch.full_like(u, 800.0),
+                     torch.where(u < 0.95, torch.full_like(u, 2200.0),
+                                 torch.full_like(u, 3400.0)))
+    hi = torch.where(u < 0.75, torch.full_like(u, 2000.0),
+                     torch.where(u < 0.95, torch.full_like(u, 3400.0),
+                                 torch.full_like(u, 4000.0)))
+    span = (hi - lo)
+    r = torch.rand(batch, generator=g) * span
+    lengths = (lo + r).long().clamp(64, 4096)
+    return lengths.tolist()
+
+
+def ref_full(q, k_pool, v_pool, kv_indptr, kv_indices, seq_lens):
     m = q.shape[0]
     device = q.device
-    n = int(seq_lens.max().item())
     kf = k_pool.reshape(-1, KVH, D)
     vf = v_pool.reshape(-1, KVH, D)
-    slots = kv_indices.reshape(m, n)
     g = H // KVH
-    h_map = torch.arange(H, device=device) // g
-    k = kf[slots].index_select(2, h_map)
-    v = vf[slots].index_select(2, h_map)
-    qh = q.unsqueeze(2).float()
-    kh = k.permute(0, 2, 1, 3).float()
-    vh = v.permute(0, 2, 1, 3).float()
-    o = torch.nn.functional.scaled_dot_product_attention(
-        qh, kh, vh, scale=1.0 / math.sqrt(D))
-    return o[:, :, 0, :].to(torch.float16)
+    scale = 1.0 / math.sqrt(D)
+    outs = []
+    for b in range(m):
+        n = int(seq_lens[b])
+        base = int(kv_indptr[b])
+        slots = kv_indices[base:base + n].long()
+        k = kf[slots].unsqueeze(2).expand(n, KVH, g, D).reshape(n, H, D)
+        v = vf[slots].unsqueeze(2).expand(n, KVH, g, D).reshape(n, H, D)
+        o = torch.nn.functional.scaled_dot_product_attention(
+            q[b].unsqueeze(1).unsqueeze(0).float(),
+            k.permute(1, 0, 2).unsqueeze(0).float(),
+            v.permute(1, 0, 2).unsqueeze(0).float(),
+            scale=scale)[0, :, 0, :]
+        outs.append(o)
+    return torch.stack(outs).to(torch.float16)
 
 
 def tl_call(q, k_pool, v_pool, kv_indptr, kv_indices, seq_lens):
@@ -122,25 +149,27 @@ def main():
               for b in args.batches.split(",")
               for c in args.ctxs.split(",")]
     results = []
-    for batch, ctx in combos:
+
+    def run_case(batch, lengths, tag):
         (q, k_pool, v_pool, block_table, seq_lens,
-         kv_indptr, kv_indices) = make_inputs(batch, ctx)
-        # KV traffic only (K and V, fp16). Q/O/index traffic is tiny by
-        # comparison and NOT counted; tl_gbs is therefore the effective
-        # KV bandwidth = theoretical bytes / measured time.
-        kv_bytes = batch * ctx * KVH * D * 2 * 2
-        qo_bytes = batch * H * D * 2 * 2  # Q read + O write, for reference
+         kv_indptr, kv_indices) = make_var_inputs(batch, lengths)
+        mean_ctx = sum(lengths) / len(lengths)
+        max_ctx = max(lengths)
+        # KV traffic is the sum of actual row lengths (varlen), not max.
+        kv_bytes = sum(lengths) * KVH * D * 2 * 2
+        qo_bytes = batch * H * D * 2 * 2
 
         def bw(ms):
             return round(kv_bytes / (ms / 1e3) / 1e9, 0)
 
         o_tl = tl_call(q, k_pool, v_pool, kv_indptr, kv_indices, seq_lens)
-        o_ref = ref_full(q, k_pool, v_pool, kv_indices, seq_lens)
+        o_ref = ref_full(q, k_pool, v_pool, kv_indptr, kv_indices, seq_lens)
         err = (o_tl.float() - o_ref.float()).abs().max().item()
         tl_ms = bench(tl_call, q, k_pool, v_pool, kv_indptr, kv_indices,
                       seq_lens)
-        splits = choose_splits(batch, KVH, ctx)
-        row = {"batch": batch, "ctx": ctx, "splits": splits,
+        splits = choose_splits(batch, KVH, max_ctx)
+        row = {"case": tag, "batch": batch, "mean_ctx": round(mean_ctx, 1),
+               "max_ctx": max_ctx, "splits": splits,
                "kv_mb": round(kv_bytes / 1e6, 1),
                "qo_mb": round(qo_bytes / 1e6, 2),
                "max_abs_err": err,
@@ -163,6 +192,12 @@ def main():
         del q, k_pool, v_pool, block_table, seq_lens, kv_indptr, kv_indices
         del o_tl, o_ref
         torch.cuda.empty_cache()
+
+    for batch, ctx in combos:
+        run_case(batch, [ctx] * batch, f"b{batch}-c{ctx}")
+
+    rl = realistic_lengths(85)
+    run_case(85, rl, "b85-varlen")
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2)
