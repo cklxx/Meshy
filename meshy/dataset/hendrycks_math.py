@@ -79,7 +79,17 @@ def extract_boxed(text: str) -> str | None:
             mm = re.match(r"(\\[A-Za-z]+|[^\s\\$}])", span[i:])
             if mm:
                 last = mm.group(1)
-    return last
+    return _trim_outer_punct(last) if last is not None else None
+
+
+def _trim_outer_punct(s: str) -> str:
+    """Drop leading/trailing sentence punctuation that isn't part of an answer.
+
+    Training golds sometimes swallow a following comma/period/semicolon into
+    the boxed group (e.g. ``\\boxed{\\text{(E)},}``). Strip such punctuation
+    only at the two ends, never an internal comma (interval/set/tuple).
+    """
+    return s.strip().strip(".,;")
 
 
 def _normalize_for_parse(s: str) -> str:
@@ -146,19 +156,84 @@ def _math_verify_pair(pred: str, gold: str, normalize: bool) -> bool:
         return False
 
 
+def _split_top_level(s: str) -> list[str] | None:
+    """Split on commas at bracket depth 0; None when there are none.
+
+    Brackets counted so a comma inside ``\\{1,2\\}`` or ``\\left( ... \\right)``
+    is not a separator.
+    """
+    depth = 0
+    parts: list[str] = []
+    start = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        elif c == "," and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+        i += 1
+    if not parts:
+        return None
+    parts.append(s[start:])
+    return parts
+
+
+def _strip_outer_brackets(s: str) -> str:
+    s = s.strip()
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    if s[:1] in pairs and s[-1:] == pairs[s[:1]]:
+        s = s[1:-1]
+    return s.strip()
+
+
+def _tuple_equiv(pred: str, gold: str) -> bool | None:
+    """Component-wise compare of tuple/interval/set answers.
+
+    math_verify 0.9.0 parses a coordinate tuple ``(a, b)`` to only its *last*
+    component (``(3,-1)`` -> -1), so it wrongly equates tuples that differ in
+    an earlier slot. Strip one layer of matching outer brackets from both
+    sides, split on the resulting top-level commas, and require an
+    equal-length, component-by-component match. Returns None when either side
+    is not a tuple, so callers fall through to scalar judging.
+    """
+    pred_n = _normalize_for_parse(pred)
+    gold_n = _normalize_for_parse(gold)
+    pi = _split_top_level(_strip_outer_brackets(pred_n))
+    gi = _split_top_level(_strip_outer_brackets(gold_n))
+    if pi is None or gi is None:
+        return None
+    if len(pi) != len(gi):
+        return False
+    return all(
+        math_equiv(_strip_outer_brackets(a), _strip_outer_brackets(b))
+        for a, b in zip(pi, gi)
+    )
+
+
 def math_equiv(pred: str | None, gold: str | None) -> bool:
     """Judge a boxed prediction against the gold MATH answer.
 
-    Order: exact string; math_verify on raw LaTeX; math_verify again after
-    normalising shorthand variants (``\\dfrac12`` → ``\\frac{1}{2}``); a
-    canonical-string compare; finally SymPy's LaTeX parser. math_verify (the
+    Order: exact string; tuple/interval component match (math_verify 0.9.0
+    drops earlier tuple components); math_verify on raw LaTeX; math_verify
+    again after normalising shorthand variants (``\\dfrac12`` →
+    ``\\frac{1}{2}``); a canonical-string compare; finally SymPy's LaTeX
+    parser. math_verify (the
     primary judge) and SymPy never raise, so an unparseable answer scores 0.
     """
     if pred is None or gold is None:
         return False
-    p, g = pred.strip(), gold.strip()
+    p, g = _trim_outer_punct(pred.strip()), _trim_outer_punct(gold.strip())
     if p == g:
         return True
+    # tuple/interval/set answers: math_verify drops earlier components, so a
+    # coordinate that differs in slot 0 would otherwise pass. Judge per slot.
+    tup = _tuple_equiv(p, g)
+    if tup is not None:
+        return tup
     if _math_verify_pair(p, g, normalize=False):
         return True
     if _math_verify_pair(p, g, normalize=True):

@@ -66,15 +66,44 @@ def test_equiv_true(pred, gold):
     ("[1,2]", "[1,3]"),
     (None, "1"),
     ("3.14", r"\pi"),
+    # math_verify 0.9.0 drops earlier tuple components: a coordinate differing
+    # in an earlier slot must NOT be accepted.
+    ("(10, -1)", "(3, -1)"),
+    ("(18, -18)", "(25, -18)"),
+    (r"\left(\frac{18}{5},\frac{2}{5},5\right)",
+     r"\left(\frac{11}{5},\frac{2}{5},5\right)"),
+    ("(1, 2)", "(1, 2, 3)"),
 ])
 def test_equiv_false(pred, gold):
     assert not math_equiv(pred, gold)
+
+
+@pytest.mark.parametrize("pred,gold", [
+    # tuple slots may each use an equivalent form
+    ("(3, -1)", "(3,-1)"),
+    (r"\left(\frac{11}{5},\frac{2}{5},5\right)",
+     r"\left( 2.2, \frac{2}{5}, 5 \right)"),
+    (r"(3,\frac{\pi}{2})", r"\left(3,\frac{\pi}{2}\right)"),
+    ("[1, 2]", "[1,2]"),
+])
+def test_tuple_equiv_true(pred, gold):
+    assert math_equiv(pred, gold), f"{pred!r} should equal {gold!r}"
 
 
 def test_normalize_expands_dfrac_shorthand():
     assert _normalize_for_parse(r"\dfrac12") == r"\frac{1}{2}"
     assert _normalize_for_parse(r"\tfrac{a}{b}") == r"\frac{a}{b}"
     assert r"\frac{1}{2}" == _canonicalize_latex(r" \dfrac {1} {2} ")
+
+
+def test_extract_strips_outer_sentence_punct():
+    # a gold that swallowed a trailing comma/period into the boxed group
+    from meshy.dataset.hendrycks_math import _trim_outer_punct
+    assert _trim_outer_punct(r"\text{(E)},") == r"\text{(E)}"
+    assert extract_boxed(THINK + r"\boxed{\text{(E)},}") == r"\text{(E)}"
+    # internal interval comma is preserved
+    assert extract_boxed(THINK + r"\boxed{(1, 2).}") == "(1, 2)"
+    assert math_equiv(r"\text{(E)}", r"\text{(E)},")
 
 
 def test_score_uses_last_boxed_and_post_think():
