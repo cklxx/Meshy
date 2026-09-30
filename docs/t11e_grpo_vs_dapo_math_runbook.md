@@ -356,30 +356,44 @@ resume 后 graph capture 重建全部 12 个 flash plan（flash 仍 called）、
 
 **全量 MATH（不切 L1–3 子集），两臂各 20 窗冷启动**，DCP interval=3 可续到 40。
 
-- 两臂：`XRL_STEPS=20 seed=42` 冷启动 `start_window=0`；评测点 **v0/5/10/15/20**
-  各 MATH500 **500×4（max_new=4096，in-loop）**；`XRL_DCP_CKPT_INTERVAL=3`
-  且 **step20 必落**（interval 3 + 末尾步）。
+- 两臂：`XRL_STEPS=20 seed=42` 冷启动 `start_window=0`。**权威判定口径＝离线
+  MATH500 500×4**（in-loop 评测器只支持 200×1，SE≈.034 判不了 3pp）：
+  - **in-loop 200×1 保留**（每 5 窗自动跑），仅作快速过程曲线，不参与判胜负。
+  - **权威离线 500×4**：每臂跑完后对里程碑权重
+    `<runtime>/weights/actor_train-0/v{5,10,15,20}` 各跑
+    `scripts/eval_math.py --data math500 --samples 4 -n 500 --max-new-tokens 4096
+    --temperature .6 --top-p .95 --top-k 20`（独立 flash+graph server，同硬门
+    协议），约 1h/点。HF 权重每个 train step 自动导出（fp16 1.2GB/个，**不被
+    DCP keep=2 prune**），里程碑无需另存 DCP；DCP 全量只留最近 2 份供续跑。
+  - **v0 基线**：基座在同一 flash+graph 路径重跑 500×4（两臂共用），替代早期
+    triton 那份做严格配对。
+  - 训练侧 `XRL_DCP_CKPT_INTERVAL=3`、**step20 必落**（interval 3 + 末尾步）。
 - GRPO 臂：`XRL_RUN_TAG=math-grpo20`，两个 DAPO env 留 0。
 - DAPO 臂：`XRL_RUN_TAG=math-dapo20`，`XRL_DYNAMIC_SAMPLING=1
   XRL_OVERLONG_SHAPING=1`。
 - 两臂同 `XRL_MAX_RUNNING=64`、同几何（512/8，mtpm4096/seq64）、同评测点。
 - 串行：先 GRPO，放卡再 DAPO，同一张卡。
 
-**v20 判胜规则（跑完 v20 才按此判，不改阈值）：**
+**v20 判胜规则（全部基于离线 500×4 lenient，跑完 v20 才按此判，不改阈值）：**
 1. **定胜负**：`Δ = lenient(v20_DAPO) − lenient(v20_GRPO) ≥ +3.0pp` **且**
    DAPO 臂 v15→v20 不回落 → DAPO 胜（Δ≤−3pp 且 v30 同向为负时为 DAPO 负，
    但 20 窗无 v30，故 20 窗只判正向胜/平/续跑）。
 2. **续到 40**：若任一臂 v15→v20 仍 **≥+1.5pp**，或 Δ 落在 **[+1.5,+3.0)pp**
    → 两臂同 tag 改 `XRL_STEPS=40` 续跑（LR 恒定、warmup=0，续跑与一次性 40 窗
-   等价），补 v25/30/35/40 评测点再判。
+   等价），补 v25/30/35/40 离线 500×4 再判。
 3. **判平**：其余情况（|Δ|<1.5pp 且两臂都已收敛）。
 
 **终点 8192 重评（评测侧，独立于 in-loop 4096）：** v0 基座、两臂终点各跑
 MATH500 500×4、`max_new_tokens=8192`，报 lenient/strict 与**截断拆分**（截断率
 骤降后未截断 acc 是否仍 v40/训练臂更高——用于区分能力 vs 被 4096 截断掩盖）。
 
-> 卡时提示：按实测生成 60–90min/窗 + 训练 23min/窗 + DCP~50s，单臂 20 窗约
-> 28–38 GPU 小时；两臂 + 评测点（5×500×4 flash 约 1h/次）合计约 70–90 GPU 小时。
+**执行顺序**：GRPO 20 窗 → GRPO 4 个里程碑（v5/10/15/20）离线 500×4 →
+DAPO 20 窗 → DAPO 4 个里程碑离线 500×4 → 基座 flash 500×4（配对 v0）→
+终点 8192 重评。
+
+> 卡时提示：训练 生成(GRPO R=1 快于冒烟 DAPO)+训练 23min/窗 + DCP~50s；离线评测
+> 每臂 4 里程碑 × ~1h ≈ **4h/臂**（另加基座 500×4 与 8192 重评）。两臂合计约
+> 训练 20–30h + 离线评测 ~10h。
 
 
 ---
