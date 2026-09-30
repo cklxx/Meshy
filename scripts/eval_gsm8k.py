@@ -226,9 +226,6 @@ def main() -> None:
         print(f"[score-only {args.score_only}]")
         print(f"questions={n} samples/q={samples}")
         print(f"lenient accuracy (per-q mean): {acc:.4f}")
-    for k, st in sorted(aggregate_pass_at_k(
-            [(len(v), sum(v)) for v in per_q.values()]).items()):
-        print(f"pass@{k}: {st['pass_at_k']:.4f}  (over {st['problems']} problems)")
         for k, st in sorted(aggregate_pass_at_k(
                 [(len(v), sum(v)) for v in per_q.values()]).items()):
             print(f"pass@{k}: {st['pass_at_k']:.4f}  (over {st['problems']} problems)")
