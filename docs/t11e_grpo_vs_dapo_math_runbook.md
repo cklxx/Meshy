@@ -404,10 +404,11 @@ v100_run_rl.sh 显式 export，并在启动前 mkdir + 可写检查）。traject
   step 3,6,…,39 共 13 份加末尾 step40。
 - 末尾份 `last_save_model_only=False`（recipe 已设），故 step40 也含优化器/LR/
   train state，可直接 resume；两臂仅末尾份改全量合计多约 8.8 GB。
-- **容量红线**：/data00 可用约 177 GB。两臂若把里程碑 DCP 全留（interval=3
-  每臂 step 3…39 共 13 份加末尾 step40 ≈ 14 份 × 7.25 GiB，两臂），实测约
-  **190 GB 超盘**。稳态靠 `checkpoint_keep=2` 自动滚动（每臂 ~14.5 GB，写下
-  一份瞬时 +7.25）；**里程碑不许全留**。
+- **容量红线**：3FS 退役后 /data00 实测可用约 **130 GB**（492 GB 盘，3FS 旧
+  engine slab 仍占盘待用户定是否删；删除前不算可回收）。两臂若把里程碑 DCP
+  全留（interval=3 每臂 step 3…39 共 13 份加末尾 step40 ≈ 14 份 × 7.25 GiB，
+  两臂），约 **190 GB 远超盘**。稳态靠 `checkpoint_keep=2` 自动滚动（每臂
+  ~14.5 GB，写下一份瞬时 +7.25）；**里程碑不许全留**。
 - 中途清理口径（与 weight-retention 一致，删前先报分数表）：
   - 每个评测点导出 HF 到 `best`/`evalckpt`、跑完评测并记录分数后，只保留最近
     2 份可 resume DCP；更早的中间 DCP 删除。
