@@ -31,6 +31,41 @@ class _AsyncMode:
         self.value = value
 
 
+def test_worker_serialization_failure_aborts_and_leaves_no_metadata(
+    tmp_path, monkeypatch
+) -> None:
+    """A worker-thread serialization error must fail the whole save and never
+    leave a .metadata that would make a torn checkpoint look resumable."""
+    import meshy.backend.titan.dcp_io as dcp_io
+
+    target = str(tmp_path / "step-1")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected serialization failure")
+
+    monkeypatch.setattr(dcp_io, "_write_item", boom)
+
+    sd = {f"t{i}": torch.randn(64, 64) for i in range(_DCP_WRITE_THREADS * 3)}
+    failed = False
+    try:
+        dcp_save(sd, storage_writer=BoundedFileSystemWriter(path=target),
+                 checkpoint_id=target)
+    except BaseException as exc:  # DCP may raise CheckpointException
+        failed = True
+        text = str(exc)
+        cur = exc
+        while cur.__cause__ is not None:
+            cur = cur.__cause__
+            text += str(cur)
+        assert "injected serialization failure" in text
+    assert failed, "a failing tensor write did not abort the save"
+
+    # Either nothing was written or data files exist without .metadata — but
+    # never a valid-looking complete checkpoint.
+    if os.path.isdir(target):
+        assert not os.path.exists(os.path.join(target, ".metadata"))
+
+
 def test_bounded_writer_round_trips_across_shards(tmp_path) -> None:
     n = _DCP_WRITE_THREADS * 5
     sd = {f"t{i:04d}": torch.randn(128, 128) for i in range(n)}
