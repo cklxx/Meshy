@@ -53,7 +53,6 @@ __global__ void flash_partial_kernel(
     const __half* __restrict__ v_flat,
     const int* __restrict__ kv_indptr,
     const int* __restrict__ kv_indices,
-    const int* __restrict__ seq_lens,
     int num_kv_heads, float scale, int chunk_tokens,
     __half* __restrict__ partial_out, float* __restrict__ partial_lse) {
   const int block_id = blockIdx.x;
@@ -69,8 +68,10 @@ __global__ void flash_partial_kernel(
   const int hw = warp * 2 + half;           // half-warp id 0..7
   const int base_dim = glane * DIMS_PER_LANE;
 
-  const int seq_len = seq_lens[seq];
+  // Row length comes from the CSR pointers themselves, so no separate
+  // length tensor / host sync is needed (CUDA-graph safe).
   const int indptr = kv_indptr[seq];
+  const int seq_len = kv_indptr[seq + 1] - indptr;
 
   // Per-lane Q for the group's two q heads.
   float q0[DIMS_PER_LANE], q1[DIMS_PER_LANE];
@@ -244,27 +245,26 @@ __global__ void flash_combine_kernel(
 void launch_flash_decode(
     torch::Tensor q, torch::Tensor k_flat, torch::Tensor v_flat,
     torch::Tensor kv_indptr, torch::Tensor kv_indices,
-    torch::Tensor seq_lens, int64_t num_splits, int64_t chunk_tokens,
+    int64_t grid_batch, int64_t num_splits, int64_t chunk_tokens,
     double scale, torch::Tensor partial_out, torch::Tensor partial_lse,
     torch::Tensor out) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const int batch = q.size(0);
   const int num_q_heads = q.size(1);
   const int num_kv_heads = num_q_heads / GROUP_SIZE;
-  const int head_blocks = batch * num_kv_heads;
+  const int head_blocks = (int)grid_batch * num_kv_heads;
   dim3 grid(head_blocks, (unsigned)num_splits);
   flash_partial_kernel<<<grid, 128, 0, stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(k_flat.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(v_flat.data_ptr<at::Half>()),
       kv_indptr.data_ptr<int>(), kv_indices.data_ptr<int>(),
-      seq_lens.data_ptr<int>(), num_kv_heads, (float)scale,
-      (int)chunk_tokens,
+      num_kv_heads, (float)scale, (int)chunk_tokens,
       reinterpret_cast<__half*>(partial_out.data_ptr<at::Half>()),
       partial_lse.data_ptr<float>());
-  flash_combine_kernel<<<batch * num_q_heads, 128, 0, stream>>>(
+  flash_combine_kernel<<<(int)grid_batch * num_q_heads, 128, 0, stream>>>(
       reinterpret_cast<const __half*>(partial_out.data_ptr<at::Half>()),
-      partial_lse.data_ptr<float>(), (int)num_splits, batch, num_kv_heads,
+      partial_lse.data_ptr<float>(), (int)num_splits, (int)grid_batch,
+      num_kv_heads,
       reinterpret_cast<__half*>(out.data_ptr<at::Half>()));
 }
 

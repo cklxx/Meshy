@@ -412,10 +412,16 @@ def apply_sm70_patch() -> bool:
         # Prewarm happens here, synchronously, before SGLang imports the
         # model — keeping first-request latency free of TileLang JIT.
         _install_tilelang_fused_ops(prewarm=True)
+    if flash_decode_enabled():
+        # Redirects triton decode attention; independent of the fused-op
+        # switch. The CUDA extension JIT-compiles on first decode call
+        # (~1 min), which the e2e warmup absorbs.
+        _install_flash_decode_attention()
     APPLIED = True
     logger.info(
         "[sglang-sm70] applied sm70 compatibility patch "
-        f"(TileLang fused ops: {'on' if tilelang_enabled() else 'off'})"
+        f"(TileLang fused ops: {'on' if tilelang_enabled() else 'off'}, "
+        f"flash decode: {'on' if flash_decode_enabled() else 'off'})"
     )
     return True
 
