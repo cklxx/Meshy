@@ -122,26 +122,50 @@ def _scalar(value: Any) -> int:
 
 
 class TrajectoryLogger:
+    """Per-sample audit log for rollout windows.
+
+    Two retention tiers (both append-only, no rewrite — a crash never loses a
+    window):
+
+    * **slim** (``XRL_TRAJ_SLIM=1``, default): every sample is logged with all
+      scalar/tag fields (round, weight_version, reward, advantage, truncation
+      flags, response_tokens, ground_truth, finish_reason, ...) but WITHOUT the
+      full ``trajectory`` dialogue. That dialogue is ~95% of a record's bytes
+      and is not needed for the quantitative audits (batch counts, crash-resend
+      vs resampling). 40 windows x 512 x ~70 B ≈ 1.4 MB/run.
+    * **full sample** (``XRL_TRAJ_FULL_SAMPLES``, default 16): that many
+      samples per window additionally keep the full ``trajectory`` (flagged
+      ``"full": true``), chosen deterministically to span the reward range for
+      qualitative inspection. ~1 MB/run.
+
+    ``XRL_TRAJ_KEEP_LINES`` remains as a backstop: if >0 the file is rolled to
+    its last N records (default 0 = off; with slim logging the bound is so low
+    this should not be needed).
+    """
+
     def __init__(self, path: str, *, verbose: bool = False) -> None:
         self.path = os.path.abspath(path)
         self.verbose = bool(verbose)
         self._lock = asyncio.Lock()
+        self.slim = os.environ.get("XRL_TRAJ_SLIM", "1") == "1"
+        self.full_samples = int(os.environ.get("XRL_TRAJ_FULL_SAMPLES", "16"))
+        self.keep_lines = int(os.environ.get("XRL_TRAJ_KEEP_LINES", "0"))
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         logger.info(
-            "RolloutWorker: trajectory logging -> {} (verbose={})",
-            self.path,
-            self.verbose,
+            "RolloutWorker: trajectory logging -> {} (verbose={}, slim={}, "
+            "full_samples/window={}, keep_lines={})",
+            self.path, self.verbose, self.slim, self.full_samples, self.keep_lines,
         )
 
-    def _record(self, sample: Any, version: int) -> dict[str, Any]:
-        record = {
+    def _scalar_fields(self, sample: Any, version: int) -> dict[str, Any]:
+        """Everything except the full dialogue; present for every sample."""
+        return {
             "timestamp": time.time(),
             # Historical trajectory consumers group samples by training round.
             # The rollout version is the exact source value used by TQ; keep
             # both fields so newer consumers can use the staleness tag directly.
             "round": version + 1,
             "weight_version": version,
-            "trajectory": list(sample.messages),
             "ground_truth": sample.ground_truth,
             "reward": sample.reward,
             "advantage": sample.advantage,
@@ -151,6 +175,34 @@ class TrajectoryLogger:
             "mixed_version": bool(getattr(sample, "mixed_version", False)),
             "response_tokens": sum(1 for m in sample.masks if m),
         }
+
+    def _full_indices(self, samples: list[Any]) -> set[int]:
+        """Deterministically pick up to full_samples indices spanning the
+        reward distribution (high/mid/low), so qualitative checks cover both
+        successes and failures. Stable across crashes: depends only on order."""
+        n = self.full_samples
+        if n <= 0:
+            return set()
+        if len(samples) <= n:
+            return set(range(len(samples)))
+        # Rank by reward (stable on ties via index), then take evenly spaced
+        # ranks so the sample spans the full reward range rather than only the
+        # top.
+        order = sorted(range(len(samples)),
+                       key=lambda i: (float(samples[i].reward), i))
+        if n == 1:
+            return {order[len(order) // 2]}
+        step = (len(order) - 1) / (n - 1)
+        return {order[round(k * step)] for k in range(n)}
+
+    def _record(self, sample: Any, version: int, *,
+                full: bool, with_dialogue: bool) -> dict[str, Any]:
+        record = self._scalar_fields(sample, version)
+        if full:
+            # Flag marks a slim-run sampled full dialogue.
+            record["full"] = True
+        if with_dialogue:
+            record["trajectory"] = list(sample.messages)
         if self.verbose:
             record.update(
                 num_tokens=len(list(sample.tokens)),
@@ -161,16 +213,72 @@ class TrajectoryLogger:
         return record
 
     async def write(self, samples: list[Any], version: int) -> None:
-        blob = "".join(
-            json.dumps(self._record(sample, version), ensure_ascii=False, default=str) + "\n"
-            for sample in samples
-        )
+        full_idx = self._full_indices(samples) if self.slim else set(range(len(samples)))
+        lines = []
+        for i, sample in enumerate(samples):
+            is_full_sample = i in full_idx
+            if self.slim:
+                # slim: only sampled records carry the dialogue, flagged full.
+                lines.append(json.dumps(
+                    self._record(sample, version,
+                                 full=is_full_sample, with_dialogue=is_full_sample),
+                    ensure_ascii=False, default=str,
+                ) + "\n")
+            else:
+                # legacy full logging for every sample, no slim "full" flag.
+                lines.append(json.dumps(
+                    self._record(sample, version,
+                                 full=False, with_dialogue=True),
+                    ensure_ascii=False, default=str,
+                ) + "\n")
+        blob = "".join(lines)
         async with self._lock:
             await asyncio.to_thread(self._append, blob)
 
+    def _tail_lines(self, n: int) -> list[str]:
+        """Return the last n newline-terminated records without reading the
+        whole (multi-GB) file: scan backwards in 1 MiB blocks from the end."""
+        block = 1 << 20
+        with open(self.path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            chunks: list[bytes] = []
+            nl = 0
+            while pos > 0 and nl <= n:
+                read = min(block, pos)
+                pos -= read
+                fh.seek(pos)
+                data = fh.read(read)
+                chunks.append(data)
+                nl += data.count(b"\n")
+            tail = b"".join(reversed(chunks))
+        lines = tail.splitlines(keepends=True)
+        # Unless the scan started at the file head, the first line is a partial
+        # record straddling a block boundary — drop it.
+        if pos > 0 and lines:
+            lines = lines[1:]
+        return [ln.decode("utf-8", errors="replace") for ln in lines[-n:]]
+
     def _append(self, blob: str) -> None:
-        with open(self.path, "a", encoding="utf-8") as output:
-            output.write(blob)
+        if self.keep_lines <= 0:
+            with open(self.path, "a", encoding="utf-8") as output:
+                output.write(blob)
+            return
+        # Backstop rolling retention: keep only the last keep_lines records
+        # across the existing file plus this window's records.
+        new_lines = [ln + "\n" for ln in blob.splitlines()]
+        spare = self.keep_lines - len(new_lines)
+        kept = (
+            self._tail_lines(spare)
+            if spare > 0 and os.path.exists(self.path)
+            else []
+        )
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as output:
+            output.writelines(kept)
+            output.writelines(new_lines)
+        os.replace(tmp, self.path)
+
 
 
 def append_window_stats(path: str | None, record: dict[str, Any]) -> None:
