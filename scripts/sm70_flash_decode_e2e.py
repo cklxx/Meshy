@@ -75,11 +75,15 @@ def load_gsm8k_prompts(model_path, data_dir, n):
     return prompts
 
 
-def start_server(model, port, flash, graph, mem_fraction, log):
+def start_server(model, port, flash, graph, mem_fraction, log,
+                 graph_max_bs=64, sentinel=None):
     env = os.environ.copy()
     env["MESHY_SGLANG_SM70"] = "1"
     env["MESHY_SM70_FLASH_DECODE"] = "1" if flash else "0"
     env["MESHY_SM70_CUDA_GRAPH"] = "1" if graph else "0"
+    env["MESHY_SM70_CUDA_GRAPH_MAX_BS"] = str(graph_max_bs)
+    if sentinel:
+        env["MESHY_FLASH_SENTINEL"] = sentinel
     env["CUDA_VISIBLE_DEVICES"] = "0"
     env["PATH"] = "/usr/local/cuda-12.4/bin:" + env.get("PATH", "")
     env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -94,7 +98,7 @@ def start_server(model, port, flash, graph, mem_fraction, log):
         "--tp-size", "1",
         "--mem-fraction-static", str(mem_fraction),
     ]
-    for key, value in sm70_server_defaults().items():
+    for key, value in sm70_server_defaults(max_bs=graph_max_bs).items():
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
             if value:
@@ -105,6 +109,31 @@ def start_server(model, port, flash, graph, mem_fraction, log):
     proc = subprocess.Popen(args, env=env, stdout=lf,
                             stderr=subprocess.STDOUT, start_new_session=True)
     return proc, lf
+
+
+def stop_server(proc, lf):
+    """Terminate by exact PID, then poll until GPU memory drains."""
+    import subprocess as sp
+    pid = proc.pid
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=120)
+    except Exception:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    lf.close()
+    # Wait until this server leaves no GPU compute process.
+    for _ in range(40):
+        out = sp.run(
+            ["nvidia-smi", "--query-compute-apps=pid",
+             "--format=csv,noheader"], capture_output=True, text=True)
+        pids = {int(x) for x in out.stdout.split() if x.isdigit()}
+        if pid not in pids:
+            break
+        time.sleep(3)
+    time.sleep(4)
 
 
 def generate(base, prompt, sampling, timeout=1800):
@@ -122,80 +151,171 @@ def consistency(model, data_dir, mem):
     report = {}
     for graph in (False, True):
         texts = {}
+        evidence = {}
         for flash in (False, True):
             tag = f"{'flash' if flash else 'triton'}-{'graph' if graph else 'eager'}"
             port = free_port()
             log = f"/data00/meshy/kern/logs/fdec_e2e_{tag}.log"
-            proc, lf = start_server(model, port, flash, graph, mem, log)
+            sentinel = f"/tmp/fdec_sent_{tag}.txt"
+            try:
+                os.remove(sentinel)
+            except FileNotFoundError:
+                pass
+            proc, lf = start_server(model, port, flash, graph, mem, log,
+                                    sentinel=sentinel)
             try:
                 wait_ready(port, proc)
                 time.sleep(3)  # settle plan/capture after first decode
                 out = generate(f"http://127.0.0.1:{port}", prompt, sampling)
                 texts[tag] = out.get("text", "")
             finally:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                proc.wait(timeout=120)
-                lf.close()
-                time.sleep(6)
+                stop_server(proc, lf)
+            if flash:
+                with open(sentinel) as f:
+                    sent = f.read()
+                installed = "flash-decode attention installed" in open(
+                    log, errors="ignore").read()
+                evidence[tag] = {
+                    "sentinel_apply_flash": "apply-flash=True" in sent,
+                    "log_installed": installed,
+                    "sentinel_flash_called": "flash-called" in sent,
+                }
         mode = "graph" if graph else "eager"
         tr, fl = texts[f"triton-{mode}"], texts[f"flash-{mode}"]
         report[mode] = {
             "exact_match": tr.strip() == fl.strip(),
             "triton_chars": len(tr), "flash_chars": len(fl),
+            "flash_evidence": evidence[f"flash-{mode}"],
         }
         print(json.dumps({"consistency": mode, **report[mode]}), flush=True)
     return report
 
 
-def throughput(model, data_dir, mem, n_prompts, n_samples):
-    """512 prompts x 8 samples, crossed order; wall + aggregate tok/s."""
-    prompts = load_gsm8k_prompts(model, data_dir, n_prompts)
-    sampling = {"temperature": 0.6, "top_p": 0.95, "top_k": 20,
-                "max_new_tokens": 512}
-    jobs = [(p, i) for p in prompts for i in range(n_samples)]
-    order = [("triton", False), ("flash", True),
-             ("flash", True), ("triton", False)]
+MATH_SUFFIX = " Let's think step by step and put the final answer in \\boxed{}."
+
+
+def load_math_prompts(model_path, n):
+    """First n rows of the concatenated Hendrycks MATH train split,
+    formatted exactly like meshy.dataset.hendrycks_math."""
+    from transformers import AutoTokenizer
+    from meshy.dataset.hendrycks_math import _load_all_subjects
+
+    tok = AutoTokenizer.from_pretrained(model_path)
+    ds = _load_all_subjects("train")
+    prompts = []
+    for row in list(ds)[:n]:
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": row["problem"] + MATH_SUFFIX},
+        ]
+        prompts.append(tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True))
+    return prompts
+
+
+def _decode_stats(log_path):
+    """Parse SGLang 'Decode batch' lines: gen throughput token/s plus
+    mean #running-req and #token over the saturated window."""
+    import re
+    import statistics
+
+    gen, run, tok = [], [], []
+    pat = re.compile(
+        r"Decode batch, #running-req: (\d+), #token: (\d+).*?gen throughput "
+        r"\(token/s\): ([\d.]+)")
+    try:
+        with open(log_path, "rb") as f:
+            for line in f:
+                m = pat.search(line.decode("utf-8", "ignore"))
+                if m:
+                    run.append(int(m.group(1)))
+                    tok.append(int(m.group(2)))
+                    gen.append(float(m.group(3)))
+    except FileNotFoundError:
+        pass
+    if not gen:
+        return None
+    # Drop the first ~10 warmup/ramp lines so the window reflects the
+    # saturated long-context regime.
+    g = gen[10:] or gen
+    return {
+        "gen_tok_s_mean": round(statistics.mean(g), 1),
+        "gen_tok_s_median": round(statistics.median(g), 1),
+        "gen_tok_s_p90": round(sorted(g)[int(0.9 * (len(g) - 1))], 1),
+        "mean_running_req": round(statistics.mean(run), 1),
+        "mean_token": round(statistics.mean(tok), 1),
+        "decode_samples": len(g),
+    }
+
+
+def throughput(model, mem, n_prompts, n_samples, inflight, window_s,
+               graph_max_bs, order=("triton", "flash"), dataset="math"):
+    """Rollout-shaped load: n_prompts*n_samples queued jobs, at most
+    ``inflight`` concurrent (rl ROLLOUT_BATCH*GROUP_SIZE=64). Runs for
+    ``window_s`` in the saturated regime, then truncates. Throughput
+    comes from the server's own per-step 'Decode batch' gen throughput.
+
+    dataset="math" uses Hendrycks MATH train; "gsm8k" uses GSM8K train.
+    Both production recipes (grpo_*_v100) roll out with
+    temp 1.0/top_p 1.0/top_k -1/max_new 4096, so sampling is identical;
+    only the prompt source differs."""
+    if dataset == "math":
+        prompts = load_math_prompts(model_path=model, n=n_prompts)
+        log_tag, sent_tag = "math", "math"
+    else:
+        prompts = load_gsm8k_prompts(model, DATA_DEFAULT, n_prompts)
+        log_tag, sent_tag = f"gsm{n_prompts}", f"gsm{n_prompts}"
+    sampling = {"temperature": 1.0, "top_p": 1.0, "top_k": -1,
+                "max_new_tokens": 4096}
+    jobs = [p for p in prompts for _ in range(n_samples)]
     runs = []
-    for label, flash in order:
-        graph = True
+    for label in order:
+        flash = label == "flash"
         port = free_port()
-        log = f"/data00/meshy/kern/logs/fdec_e2e_tp_{label}.log"
-        proc, lf = start_server(model, port, flash, graph, mem, log)
+        log = f"/data00/meshy/kern/logs/fdec_{log_tag}_{label}.log"
+        sentinel = f"/tmp/fdec_sent_{sent_tag}_{label}.txt"
+        try:
+            os.remove(sentinel)
+        except FileNotFoundError:
+            pass
+        proc, lf = start_server(model, port, flash, True, mem, log,
+                                graph_max_bs=graph_max_bs, sentinel=sentinel)
         try:
             wait_ready(port, proc)
-            # Warmup then the measured finite batch.
-            generate(f"http://127.0.0.1:{port}", prompts[0],
-                     {**sampling, "max_new_tokens": 8}, timeout=900)
             base = f"http://127.0.0.1:{port}"
-            t0 = time.perf_counter()
+            generate(base, prompts[0],
+                     {**sampling, "max_new_tokens": 8}, timeout=900)
 
-            def one(job):
-                p, _ = job
-                r = generate(base, p, sampling, timeout=1800)
-                ct = r.get("meta_info", {}).get("completion_tokens", 0)
-                return ct if isinstance(ct, int) else len(ct)
+            def one(p):
+                try:
+                    generate(base, p, sampling, timeout=window_s + 1200)
+                except Exception:
+                    return
 
-            with ThreadPoolExecutor(max_workers=64) as pool:
-                toks = list(pool.map(one, jobs))
-            wall = time.perf_counter() - t0
-            total = sum(toks)
-            row = {"backend": label, "requests": len(jobs),
-                   "wall_s": round(wall, 2),
-                   "total_new_tokens": total,
-                   "decode_tok_s": round(total / wall, 1)}
+            pool = ThreadPoolExecutor(max_workers=inflight)
+            pool.map(one, jobs)
+            # Saturated window; requests run to EOS/4096 in background.
+            time.sleep(window_s)
+            stats = _decode_stats(log) or {}
+            try:
+                sent = open(sentinel).read()
+            except FileNotFoundError:
+                sent = ""
+            row = {"backend": label, "dataset": dataset,
+                   "inflight": inflight,
+                   "kv_layout": "nhd3-token-major",
+                   "window_s": window_s, "queued": len(jobs),
+                   "sentinel_apply_flash": "apply-flash=True" in sent,
+                   "sentinel_flash_called": "flash-called" in sent,
+                   "log_installed": (
+                       "flash-decode attention installed"
+                       in open(log, errors="ignore").read()),
+                   **stats}
             runs.append(row)
             print(json.dumps(row), flush=True)
+            pool.shutdown(wait=False, cancel_futures=True)
         finally:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            proc.wait(timeout=120)
-            lf.close()
-            time.sleep(6)
-    # Cross-order average.
-    for label in ("triton", "flash"):
-        rs = [r for r in runs if r["backend"] == label]
-        avg = sum(r["decode_tok_s"] for r in rs) / len(rs)
-        print(json.dumps({"avg": label, "decode_tok_s": round(avg, 1)}),
-              flush=True)
+            stop_server(proc, lf)
     return runs
 
 
@@ -206,6 +326,14 @@ def main():
     ap.add_argument("--mem", type=float, default=0.60)
     ap.add_argument("--prompts", type=int, default=512)
     ap.add_argument("--samples", type=int, default=8)
+    ap.add_argument("--inflight", type=int, default=64,
+                    help="concurrent requests; rl in-flight = 8*8 = 64")
+    ap.add_argument("--window", type=int, default=600,
+                    help="saturated decode window seconds per backend")
+    ap.add_argument("--graph-max-bs", type=int, default=64,
+                    help="matches rl MESHY_SM70_CUDA_GRAPH_MAX_BS")
+    ap.add_argument("--order", default="triton,flash")
+    ap.add_argument("--dataset", choices=["math", "gsm8k"], default="math")
     ap.add_argument("--out", default="/data00/meshy/kern/flash_decode_e2e.json")
     ap.add_argument("--only", choices=["consistency", "throughput", "all"],
                     default="all")
@@ -216,8 +344,10 @@ def main():
     if args.only in ("consistency", "all"):
         report["consistency"] = consistency(args.model, args.data, args.mem)
     if args.only in ("throughput", "all"):
-        report["throughput"] = throughput(
-            args.model, args.data, args.mem, args.prompts, args.samples)
+        report[f"throughput_{args.dataset}"] = throughput(
+            args.model, args.mem, args.prompts, args.samples,
+            args.inflight, args.window, args.graph_max_bs,
+            tuple(args.order.split(",")), dataset=args.dataset)
     with open(args.out, "w") as f:
         json.dump(report, f, indent=2)
     print("FLASH_DECODE_E2E_DONE ->", args.out)

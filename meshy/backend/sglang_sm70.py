@@ -176,6 +176,118 @@ def tilelang_enabled() -> bool:
     return os.environ.get("MESHY_SM70_TILELANG", "0") == "1"
 
 
+def flash_decode_enabled() -> bool:
+    """Whether the sm70 CUDA flash-decode backend is on."""
+    import os
+
+    return os.environ.get("MESHY_SM70_FLASH_DECODE", "0") == "1"
+
+
+def _install_flash_decode_attention() -> None:
+    """Replace SGLang triton decode attention with the sm70 CUDA kernel.
+
+    Wraps ``sglang.kernels.ops.attention.decode_attention.decode_attention_fwd``
+    (the single symbol the triton backend calls — see
+    triton_backend.py lazy import). Only decode-shaped calls (3-D q,
+    4-D c128 paged pool, the Qwen3 head geometry, logit_cap 0) are
+    intercepted; everything else calls the original triton function, so
+    prefill/extend/MLA paths are untouched.
+
+    CUDA-graph safety: launch geometry is fixed per capture batch by a
+    plan built on first call, with split/chunk chosen to cover a fixed
+    max-context budget (MESHY_SM70_FLASH_DECODE_MAX_CTX). No host sync
+    and no context-dependent grid change on replay; row lengths are read
+    inside the kernel from kv_indptr. Tokens past the budget cannot
+    occur (server context is bounded by the same value).
+    """
+    import os
+
+    import torch
+
+    import sglang.kernels.ops.attention.decode_attention as _da
+    from meshy.kernels import flash_decode as _fd
+
+    if getattr(_da, "_meshy_flash_installed", False):
+        return
+    orig = _da.decode_attention_fwd
+
+    max_ctx = int(os.environ.get("MESHY_SM70_FLASH_DECODE_MAX_CTX", "4096"))
+    plans: dict = {}
+    _sentinel = os.environ.get("MESHY_FLASH_SENTINEL")
+
+    def _mark(msg):
+        if _sentinel:
+            try:
+                with open(_sentinel, "a") as _sf:
+                    _sf.write(f"pid={os.getpid()} {msg}\n")
+            except OSError:
+                pass
+
+    _mark("apply-flash=True")
+
+    def decode_attention_fwd(
+        q, k_buffer, v_buffer, o, kv_indptr, kv_indices,
+        attn_logits, attn_lse, num_kv_splits, max_kv_splits,
+        sm_scale, k_scale=1.0, v_scale=1.0, logit_cap=0.0,
+        sinks=None, xai_temperature_len=-1, has_mla=False,
+        use_pdl=False, page_size=1, score_mod=None, aux_tensors=None,
+    ):
+        # Eligibility guard — fall through to triton on anything the
+        # CUDA kernel does not cover. The KV pool may be either the 3-D
+        # token-major view [slots, kvh, d] (page_size=1) or the c128 4-D
+        # shared pool [pages, 16, kvh, d]; both reshape to
+        # [-1, kvh, d], and kv_indices already holds flat slots
+        # (page*16+tok for c128), so page_size is irrelevant here.
+        eligible = (
+            not has_mla and logit_cap == 0.0 and sinks is None
+            and xai_temperature_len == -1 and score_mod is None
+            and aux_tensors is None
+            and q.dim() == 3 and q.dtype == torch.float16
+            and k_buffer.dim() in (3, 4) and v_buffer.dim() == k_buffer.dim()
+            and k_buffer.shape[-1] == v_buffer.shape[-1] == q.shape[-1]
+            and q.shape[-1] == _fd._HEAD_DIM
+        )
+        if not eligible:
+            return orig(
+                q, k_buffer, v_buffer, o, kv_indptr, kv_indices,
+                attn_logits, attn_lse, num_kv_splits, max_kv_splits,
+                sm_scale, k_scale, v_scale, logit_cap=logit_cap,
+                sinks=sinks, xai_temperature_len=xai_temperature_len,
+                has_mla=has_mla, use_pdl=use_pdl, page_size=page_size,
+                score_mod=score_mod, aux_tensors=aux_tensors)
+
+        m, h, d = q.shape
+        kvh = k_buffer.shape[-2]
+        plan = plans.get(m)
+        if plan is None:
+            # Built once per (capture) batch; split/chunk fixed for the
+            # context budget so the grid never changes under graph replay.
+            plan = _fd.make_plan(h, kvh, d, m, max_ctx, q.device)
+            plans[m] = plan
+            _mark(f"flash-called m={m} splits={plan.num_splits} "
+                  f"chunk={plan.chunk_tokens}")
+            logger.info(
+                "[sglang-sm70] flash-decode plan: batch=%d splits=%d "
+                "chunk=%d (max_ctx=%d)",
+                m, plan.num_splits, plan.chunk_tokens, max_ctx)
+
+        k_flat = k_buffer.reshape(-1, kvh, d)
+        v_flat = v_buffer.reshape(-1, kvh, d)
+        # page_size 1 pools store one slot per token directly; c128 pools
+        # store slots = page*16+tok, which is exactly kv_indices' value,
+        # so the same flat index works for both.
+        out = _fd.run_with_plan(
+            q, k_flat, v_flat, kv_indptr, kv_indices, plan,
+            sm_scale * float(k_scale), out=o)
+        return out
+
+    _da.decode_attention_fwd = decode_attention_fwd
+    _da._meshy_flash_installed = True
+    logger.info(
+        "[sglang-sm70] flash-decode attention installed "
+        f"(MESHY_SM70_FLASH_DECODE, max_ctx={max_ctx})")
+
+
 def _install_tilelang_fused_ops(*, prewarm: bool = True) -> None:
     """Redirect RMSNorm / fused_add_rmsnorm / SiLUAndMul to meshy.kernels.
 
@@ -392,8 +504,20 @@ def resume_tags() -> tuple[str, ...]:
 
 
 def bootstrap_pythonpath() -> str | None:
-    """Directory containing the sm70 sitecustomize, or None."""
+    """PYTHONPATH entries for sm70 server child processes.
+
+    Returns the repository root **followed by** the sitecustomize
+    directory. The root must come first so ``import meshy`` resolves to
+    this tree instead of an unrelated editable/pip install (e.g. an
+    ``__editable___meshy`` .pth pointing at another checkout); the
+    ``_sm70bootstrap`` dir still contributes the startup ``sitecustomize``
+    (Python scans every sys.path entry for it).
+    """
     import os
 
-    return os.path.join(os.path.dirname(__file__), "_sm70bootstrap")
+    boot = os.path.join(os.path.dirname(__file__), "_sm70bootstrap")
+    # meshy/backend/sglang_sm70.py -> repo root is three levels up.
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+    return root + os.pathsep + boot
 
