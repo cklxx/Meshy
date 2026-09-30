@@ -131,3 +131,79 @@ def test_aggregate_reports_only_supported_k():
     # means equal the single problem's estimator when one contributes
     assert agg[16]["pass_at_k"] == pytest.approx(pass_at_k(32, 8, 16))
     assert agg[32]["pass_at_k"] == pytest.approx(pass_at_k(32, 8, 32))
+
+
+# ---- T11c: math_verify 0.9.0 tuple-parsing regression, dataset-free -------
+# math_verify alone parses (a,b) to only its last component, so it wrongly
+# equates tuples differing in an earlier slot. math_equiv must not.
+
+def test_math_verify_upstream_tuple_bug_is_guarded():
+    from math_verify import parse, verify
+    # documents the upstream behaviour we work around
+    assert verify(parse("(10, -1)"), parse("(3, -1)")) is True
+    # our judge rejects it
+    assert math_equiv("(10, -1)", "(3, -1)") is False
+
+
+@pytest.mark.parametrize("pred,gold,want", [
+    # pairs (2-tuple)
+    ("(3, -1)", "(3, -1)", True),
+    ("(10, -1)", "(3, -1)", False),
+    ("(18, -18)", "(18,-18)", True),
+    ("(18, -18)", "(25, -18)", False),
+    # triples
+    (r"(\frac{11}{5},\frac{2}{5},5)", r"(\frac{11}{5},\frac{2}{5},5)", True),
+    (r"(\frac{18}{5},\frac{2}{5},5)", r"(\frac{11}{5},\frac{2}{5},5)", False),
+    (r"(2.2,0.4,5)", r"(\frac{11}{5},\frac{2}{5},5)", True),
+    # arity mismatch
+    ("(1, 2, 3)", "(1, 2)", False),
+    # union-of-intervals: a comma-bearing compound answer that must match on
+    # each bound, both raw and restyled
+    (r"(-\infty,2)\cup(2,\infty)", r"(-\infty, 2) \cup (2, \infty)", True),
+    (r"(-\infty,3)\cup(3,\infty)", r"(-\infty, 2) \cup (2, \infty)", False),
+])
+def test_tuple_and_union_grading(pred, gold, want):
+    assert math_equiv(pred, gold) is want
+
+
+def test_scalar_unaffected_by_tuple_guard():
+    # a bare scalar never enters the tuple path
+    assert math_equiv("0.5", r"\frac{1}{2}")
+    assert not math_equiv("0.5", r"\frac{1}{3}")
+
+
+# ---- T11c: empty-gold rows never become false 0-reward samples ------------
+
+def test_row_gold_detects_empty_boxed():
+    from meshy.dataset.hendrycks_math import _row_gold
+    assert _row_gold({"solution": r"answer is $\boxed{}$."}) is None
+    assert _row_gold({"solution": r"so $\boxed{42}$"}) == "42"
+    assert _row_gold({"answer": r"\frac12"}) == r"\frac12"
+    assert _row_gold({"answer": "  "}) is None
+
+
+def test_drop_rows_without_gold_filters_by_default_and_raises_strict():
+    from datasets import Dataset
+    from meshy.dataset.hendrycks_math import (
+        GoldAnswerError,
+        _drop_rows_without_gold,
+    )
+    ds = Dataset.from_list([
+        {"problem": "a", "solution": r"$\boxed{1}$"},
+        {"problem": "b", "solution": r"$\boxed{}$"},   # empty gold
+        {"problem": "c", "solution": r"$\boxed{3}$"},
+    ])
+    kept = _drop_rows_without_gold(ds, strict=False)
+    assert len(kept) == 2
+    assert [r["problem"] for r in kept] == ["a", "c"]
+    with pytest.raises(GoldAnswerError):
+        _drop_rows_without_gold(ds, strict=True)
+
+
+def test_reward_raises_on_empty_gold():
+    import types
+    from meshy.dataset.hendrycks_math import GoldAnswerError, HendrycksMATH
+    s = types.SimpleNamespace(
+        messages=[None, {"content": "</think>\boxed{0}"}], ground_truth="")
+    with pytest.raises(GoldAnswerError):
+        HendrycksMATH.reward(s)

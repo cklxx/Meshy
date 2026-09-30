@@ -41,7 +41,13 @@ from transformers import AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eval_gsm8k as g  # reuse start_server / wait_healthy / generate helpers
 
-from meshy.dataset.hendrycks_math import SUFFIX, SYSTEM_PROMPT, score_math_response
+from meshy.dataset.hendrycks_math import (
+    SUFFIX,
+    SYSTEM_PROMPT,
+    extract_boxed,
+    score_math_response,
+    score_math_response_strict,
+)
 from meshy.utils.passatk import aggregate_pass_at_k
 
 MATH500_ID = "HuggingFaceH4/MATH-500"
@@ -82,10 +88,18 @@ def build_prompts(model_path: str, rows):
     return prompts, gts
 
 
-def summarize(per_q: dict[int, list[int]]):
-    counts = [(len(v), sum(v)) for v in per_q.values()]
-    agg = aggregate_pass_at_k(counts, ks=DEFAULT_KS)
-    return agg, counts
+def _print_passk(label, agg):
+    for k, st in sorted(agg.items()):
+        print(f"{label} pass@{k}: {st['pass_at_k']:.4f}  "
+              f"(over {st['problems']} problems, n>={st['samples_per_problem']})")
+
+
+def _tally(rows, key):
+    n = max(r["q"] for r in rows) + 1
+    per_q = {i: [] for i in range(n)}
+    for r in rows:
+        per_q[r["q"]].append(r[key])
+    return per_q
 
 
 def main() -> None:
@@ -98,7 +112,8 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=0, help="0 = all 500")
     ap.add_argument("--samples", type=int, default=32,
                     help="independent samples per question (pass@k needs >=k)")
-    ap.add_argument("--max-new-tokens", type=int, default=4096)
+    ap.add_argument("--max-new-tokens", type=int, default=8192,
+                    help="match the GSM8K endpoint eval (8192); in-loop uses 4096")
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=20)
@@ -113,12 +128,13 @@ def main() -> None:
 
     if args.score_only:
         rows = [json.loads(line) for line in open(args.score_only)]
-        n = max(r["q"] for r in rows) + 1
-        per_q = {i: [] for i in range(n)}
-        for r in rows:
-            per_q[r["q"]].append(r["correct"])
-        agg, counts = summarize(per_q)
-        _print(agg)
+        _print_passk("lenient", aggregate_pass_at_k(
+            [(len(v), sum(v)) for v in _tally(rows, "lenient").values()]))
+        _print_passk("strict", aggregate_pass_at_k(
+            [(len(v), sum(v)) for v in _tally(rows, "strict").values()]))
+        total = len(rows)
+        fmt = sum(r.get("pred") is not None for r in rows) / total
+        print(f"boxed format rate: {fmt:.4f}  questions={max(r['q'] for r in rows)+1}")
         return
 
     if args.greedy:
@@ -155,40 +171,47 @@ def main() -> None:
             proc.terminate()
             proc.wait()
 
-    per_q = {qi: [] for qi in range(n)}
-    trunc = lengths = 0
+    per_q_lenient = {qi: [] for qi in range(n)}
+    per_q_strict = {qi: [] for qi in range(n)}
+    trunc = lengths = fmt = 0
+    total = n * args.samples
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as fh:
         for qi, resp in responses:
             text = resp.get("text", "")
-            ok = score_math_response(text, gts[qi])
+            pred = extract_boxed(text)
+            ok_l = score_math_response(text, gts[qi])       # math_verify/SymPy
+            ok_s = score_math_response_strict(text, gts[qi])  # exact normalised
             meta = resp.get("meta_info") or {}
             if g._finish_type(meta) == "length":
                 trunc += 1
             toks = meta.get("output_token_length") or 0
             lengths += int(toks)
-            per_q[qi].append(int(ok))
+            fmt += pred is not None
+            per_q_lenient[qi].append(int(ok_l))
+            per_q_strict[qi].append(int(ok_s))
             fh.write(json.dumps({
-                "q": qi, "gt": gts[qi], "correct": bool(ok),
-                "tokens": int(toks),
+                "q": qi, "gt": gts[qi],
+                "lenient": bool(ok_l), "strict": bool(ok_s),
+                "correct": bool(ok_l),  # back-compat alias for lenient
+                "pred": pred, "tokens": int(toks),
                 "finish": g._finish_type(meta), "response": text,
             }, ensure_ascii=False) + "\n")
 
-    agg, counts = summarize(per_q)
+    agg_l = aggregate_pass_at_k(
+        [(len(v), sum(v)) for v in per_q_lenient.values()])
+    agg_s = aggregate_pass_at_k(
+        [(len(v), sum(v)) for v in per_q_strict.values()])
     print(f"data={args.data} questions={n} samples/q={args.samples} "
           f"mode={'greedy' if args.greedy else 'sample'} "
+          f"max_new_tokens={args.max_new_tokens} split=test "
           f"elapsed={time.time()-started:.1f}s")
-    _print(agg)
-    total = n * args.samples
+    _print_passk("lenient", agg_l)
+    _print_passk("strict", agg_s)
+    print(f"boxed format rate: {fmt}/{total} = {fmt/total:.4f}")
     print(f"truncation rate: {trunc}/{total} = {trunc/total:.4f}")
     print(f"mean output tokens: {lengths/total:.0f}")
     print(f"-> {args.out}")
-
-
-def _print(agg):
-    for k, st in sorted(agg.items()):
-        print(f"pass@{k}: {st['pass_at_k']:.4f}  "
-              f"(over {st['problems']} problems, n>={st['samples_per_problem']})")
 
 
 if __name__ == "__main__":

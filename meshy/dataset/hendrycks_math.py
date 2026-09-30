@@ -175,17 +175,78 @@ def score_math_response(text: str, gold: str) -> bool:
     return math_equiv(extract_boxed(text), gold)
 
 
+def strict_math_match(pred: str | None, gold: str | None) -> bool:
+    """Strict口径: canonicalised-string equality only (no semantic equivalence).
+
+    The lenient口径 (:func:`math_equiv`) treats ``\\frac12``, ``0.5`` and
+    ``1/2`` as equal via SymPy; strict reports how often the emitted answer is
+    already in the exact normalised form of the gold (a format-conformance
+    number, like eval_gsm8k's strict vs lenient pair).
+    """
+    if pred is None or gold is None:
+        return False
+    return _canonicalize_latex(pred) == _canonicalize_latex(gold)
+
+
+def score_math_response_strict(text: str, gold: str) -> bool:
+    return strict_math_match(extract_boxed(text), gold)
+
+
+class GoldAnswerError(ValueError):
+    """A MATH row has no usable boxed gold answer.
+
+    Raised (instead of silently scoring every response 0) when
+    ``strict_gold=True``; by default such rows are filtered out with a logged
+    warning so they can never become false-negative zero-reward samples that
+    skew DAPO's per-group zero-variance drop statistics.
+    """
+
+
+def _row_gold(data: dict[str, Any]) -> str | None:
+    if "answer" in data:
+        g = data["answer"]
+    else:
+        g = extract_boxed(data.get("solution", ""))
+    return g if isinstance(g, str) and g.strip() else None
+
+
+def _drop_rows_without_gold(ds, *, strict: bool):
+    """Remove (or loudly reject) rows whose boxed gold is empty/None.
+
+    The EleutherAI mirror has two Number Theory rows whose final
+    ``\\boxed{}`` is an empty placeholder (the prose answer is 0 but the 0 was
+    never put in the box). An empty gold cannot be judged: training on it
+    would mark every response wrong regardless of content.
+    """
+    bad = [i for i, r in enumerate(ds) if _row_gold(r) is None]
+    if not bad:
+        return ds
+    msg = (f"Hendrycks MATH: {len(bad)} row(s) have an empty boxed gold and "
+           f"cannot be scored (ids {bad[:10]}{'...' if len(bad) > 10 else ''}); "
+           "their prose answer is typically 0 but the box is empty.")
+    if strict:
+        raise GoldAnswerError(msg + " Set strict_gold=False to filter them out.")
+    import logging
+
+    logging.getLogger("meshy.dataset.hendrycks_math").warning(
+        msg + " Filtering them out of training so they are not false 0-reward rows."
+    )
+    keep = [i for i in range(len(ds)) if i not in set(bad)]
+    return ds.select(keep)
+
+
 class HendrycksMATH(Dataset):
     """Hendrycks MATH (EleutherAI mirror, seven subject configs concatenated).
 
     The base loader binds one config; algebra satisfies its constructor, then
     the underlying dataset is swapped for the concatenation of all seven
-    subject splits (7500 train / 5000 test). The extra algebra load is one
-    cached 1744-row read.
+    subject splits (7500 train / 5000 test, minus rows with an empty boxed
+    gold). The extra algebra load is one cached 1744-row read.
     """
 
     def __init__(self, batch_size: int, split: str = "train",
-                 hf_kwargs: dict = {}, seed: int | None = None, **kw):
+                 hf_kwargs: dict = {}, seed: int | None = None,
+                 strict_gold: bool = False, **kw):
         super().__init__(
             hf_kwargs={
                 "path": "EleutherAI/hendrycks_math",
@@ -197,7 +258,11 @@ class HendrycksMATH(Dataset):
             seed=seed,
             **kw,
         )
-        self._base_dataset = _load_all_subjects(split)
+        full = _load_all_subjects(split)
+        self._dropped_gold_rows = [
+            i for i, r in enumerate(full) if _row_gold(r) is None
+        ]
+        self._base_dataset = _drop_rows_without_gold(full, strict=strict_gold)
         self.dataset = self._base_dataset
         if seed is not None:
             self._apply_epoch(0)
@@ -207,11 +272,17 @@ class HendrycksMATH(Dataset):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": data["problem"] + SUFFIX},
         ])
-        sample.ground_truth = data["answer"]
+        sample.ground_truth = _row_gold(data)
         return sample
 
     @staticmethod
     def reward(sample: Sample) -> float:
+        if not sample.ground_truth:
+            # Defensive: a missing gold must never be a 0-reward data point.
+            raise GoldAnswerError(
+                "empty ground_truth reached the reward; filter upstream "
+                "(HendrycksMATH drops these by default)"
+            )
         return 1.0 if score_math_response(sample.messages[-1]["content"],
                                          sample.ground_truth) else 0.0
 
