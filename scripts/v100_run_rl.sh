@@ -52,6 +52,17 @@ export PYTHONPATH=/data00/meshy/rl/meshy
 # wasted ~1.6 GiB on a 31 GiB host. TQ storage is dict-backed (measured RSS
 # ~23 MiB), so prealloc needs no shrink even at a 512-sample window.
 export XRL_TQ_STORAGE_UNITS=1
+# Local-disk storage root (user order 2026-09-30: 3FS retired; ckpt + rollout
+# live on /data00). Exported explicitly together with XRL_RUNTIME_DIR: setting
+# only the root left trajectories on the old /3fs path (v100_inloop/recipe
+# default for rollout before T5i). KV cache is configured separately.
+: "${XRL_STORAGE_ROOT:=/data00/meshy/store}"
+export XRL_STORAGE_ROOT
+mkdir -p "$XRL_STORAGE_ROOT/rollout" "$XRL_STORAGE_ROOT/ckpt"
+if [ ! -d "$XRL_STORAGE_ROOT/rollout" ] || [ ! -w "$XRL_STORAGE_ROOT/rollout" ]; then
+  echo "FATAL: $XRL_STORAGE_ROOT/rollout missing or not writable" >&2
+  exit 1
+fi
 # Slim two-tier trajectory audit log (T5i): ~240 B/sample structured record +
 # 16 full dialogues/window, append-only, ~454 KB/window. Default is already on;
 # exported explicitly so the launch log line (slim=True) is self-documenting.
@@ -60,7 +71,7 @@ export XRL_TRAJ_SLIM
 # Fresh timestamped dir per run; a caller resuming from a DCP checkpoint pins
 # XRL_RUNTIME_DIR to the original run so trajectories/TB/eval keep appending
 # there and XRL_RUN_TAG points at that run's checkpoint folder.
-: "${XRL_RUNTIME_DIR:=/3fs/stage/meshy/rollout/rl-${XRL_RUN_TAG}-$(date +%Y%m%d-%H%M%S)}"
+: "${XRL_RUNTIME_DIR:=$XRL_STORAGE_ROOT/rollout/rl-${XRL_RUN_TAG}-$(date +%Y%m%d-%H%M%S)}"
 export XRL_RUNTIME_DIR
 echo "RUNTIME=$XRL_RUNTIME_DIR"
 echo "COMMIT=$(git rev-parse HEAD 2>/dev/null || cat DEPLOY_COMMIT 2>/dev/null || cat /data00/meshy/rl/COMMIT 2>/dev/null)"

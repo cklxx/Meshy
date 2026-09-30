@@ -96,6 +96,11 @@ def main() -> None:
         if value is not None:
             os.environ[env_name] = value
 
+    # Publish the resolved recipe leaf name so resume/cursor helpers (which may
+    # run without v100_run_rl.sh, e.g. the runbook smoke command) resolve the
+    # same <ckpt>/<recipe>/<run> directory the recipe's dump_folder writes to.
+    os.environ["XRL_RECIPE"] = args.recipe.rsplit(".", 1)[-1]
+
     recipe = importlib.import_module(args.recipe)
     service_groups = recipe.SERVICE_GROUPS
     total_cards = sum(sg.n_gpus for sg in service_groups)

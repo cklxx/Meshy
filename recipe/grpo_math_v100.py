@@ -94,7 +94,7 @@ MODEL_FLAVOR = os.environ.get("XRL_MODEL_FLAVOR", "0.6B")
 SEQ_LEN = int(os.environ.get("XRL_SEQ_LEN", "5120"))
 MAX_NEW_TOKENS = int(os.environ.get("XRL_MAX_NEW_TOKENS", "4096"))
 
-STORAGE_ROOT = os.environ.get("XRL_STORAGE_ROOT", "/3fs/stage/meshy")
+STORAGE_ROOT = os.environ.get("XRL_STORAGE_ROOT", "/data00/meshy/store")
 CKPT_DIR = os.environ.get("XRL_CKPT_DIR", os.path.join(STORAGE_ROOT, "ckpt"))
 ROLLOUT_DIR = os.environ.get("XRL_ROLLOUT_DIR", os.path.join(STORAGE_ROOT, "rollout"))
 
@@ -130,6 +130,11 @@ def _trainer_config() -> TrainerConfig:
         enable_checkpoint=os.environ.get("XRL_ENABLE_DCP_CKPT", "1") == "1",
         checkpoint_interval=int(os.environ.get("XRL_DCP_CKPT_INTERVAL", "10")),
         checkpoint_keep=int(os.environ.get("XRL_DCP_CKPT_KEEP", "2")),
+        # The final-window DCP must resume a crashed arm, so keep optimizer/LR/
+        # train state (torchtitan default True writes weights-only). Both GRPO
+        # and DAPO arms use this one recipe, so this covers both; the full final
+        # DCP costs ~8.8 GB extra across the two arms.
+        last_save_model_only=os.environ.get("XRL_LAST_SAVE_MODEL_ONLY", "0") == "1",
         dump_folder=os.path.join(
             CKPT_DIR,
             "grpo_math_v100",

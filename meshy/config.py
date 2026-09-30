@@ -75,6 +75,11 @@ class TrainerConfig:
     #: DCP snapshots to retain. torchtitan requires >=2 when non-zero.
     checkpoint_keep: int = 2
     dump_folder: str = "./outputs"
+    #: torchtitan writes the final checkpoint model-only by default (no
+    #: optimizer / LR scheduler / train state), so that last snapshot cannot
+    #: resume. Set False on runs that must be crash-resumable from the final
+    #: window; the full final DCP is larger (~fp32 master + Adam state).
+    last_save_model_only: bool = True
     compile_model: bool = False
     compile_backend: str = "inductor"
     # torchtitan's per-transformer-block activation checkpointing. "selective"

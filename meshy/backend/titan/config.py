@@ -146,6 +146,9 @@ def build_forge_config(
             initial_load_path=hf_model_path,
             initial_load_in_hf=bool(hf_model_path),
             initial_load_model_only=True,
+            # Final DCP keeps optimizer/LR/train state when the recipe needs a
+            # resumable last checkpoint (torchtitan default True = weights only).
+            last_save_model_only=trainer.last_save_model_only,
         ),
         activation_checkpoint=ActivationCheckpointConfig(
             mode=trainer.activation_checkpoint_mode,

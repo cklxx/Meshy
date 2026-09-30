@@ -15,7 +15,7 @@ One-screen report for cron / pre-flight / patrol:
 Everything is read-only. Override the budget / window size via env:
   XRL_BUDGET_GB       logical budget in GiB the runs may consume (default 200)
   XRL_WINDOW_GB       expected logical GB written per window (default 1.0)
-  XRL_MESHY_ROOT      3FS meshy root (default /3fs/stage/meshy)
+  XRL_MESHY_ROOT      meshy storage root (default /data00/meshy/store)
   XRL_LOCAL_MOUNT     physical data mount (default /data00)
 """
 
@@ -25,7 +25,7 @@ import os
 import subprocess
 import time
 
-ROOT = os.environ.get("XRL_MESHY_ROOT", "/3fs/stage/meshy")
+ROOT = os.environ.get("XRL_MESHY_ROOT", "/data00/meshy/store")
 LOCAL = os.environ.get("XRL_LOCAL_MOUNT", "/data00")
 BUDGET_GB = float(os.environ.get("XRL_BUDGET_GB", "200"))
 WINDOW_GB = float(os.environ.get("XRL_WINDOW_GB", "1.0"))
@@ -96,15 +96,15 @@ def main() -> None:
     logical_free = max(BUDGET_GB - total_logical, 0.0)
     traj_gb, windows, run = latest_window_marker(ROOT)
 
-    print(f"3FS watchdog  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"storage watchdog  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"root          {ROOT}")
-    print(f"logical used  {total_logical:7.1f} GB   (budget {BUDGET_GB:.0f} GB, "
+    print(f"used          {total_logical:7.1f} GB   (budget {BUDGET_GB:.0f} GB, "
           f"headroom {logical_free:7.1f} GB)")
     for k in ("rollout", "ckpt", "kvcache"):
         if k in by_part:
             print(f"  - {k:8s} {by_part[k]:7.1f} GB")
-    print(f"physical      /data00 used {phys_used:7.1f} GB, df-avail {phys_avail:7.1f} GB"
-          f"  (slab prealloc; does NOT shrink on delete)")
+    print(f"disk          {LOCAL} used {phys_used:7.1f} GB, df-avail {phys_avail:7.1f} GB"
+          f"  (local /data00; delete frees space)")
     if run:
         print(f"active run    {run}: {windows} windows, trajectories {traj_gb:.2f} GB")
     budget_windows = int(logical_free / WINDOW_GB) if WINDOW_GB > 0 else 0

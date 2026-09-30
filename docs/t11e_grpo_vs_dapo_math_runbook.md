@@ -391,6 +391,29 @@ OOM；一旦 smoke 崩溃，先停下来修稳定性（§3.1 风险项），不�
 9. 用统一脚本出三对齐轴曲线 + §4 判据，结论落一张对照表（含 DAPO 实际补样
    倍率与每 GPU 小时解题率）。
 
+### 5.1 本地盘容量与 DCP 中途清理（3FS 已退役，2026-09-30 用户定）
+
+存储根已从 `/3fs/stage/meshy` 迁到本地 **`/data00/meshy/store`**（`XRL_STORAGE_ROOT`，
+v100_run_rl.sh 显式 export，并在启动前 mkdir + 可写检查）。trajectories 走
+`XRL_RUNTIME_DIR`（同根 `rollout/`），不再有"只设 storage root、轨迹仍落 3FS"的缝。
+
+- **DCP 实测 7.25 GiB/份**（fp32 master + fp16 + Adam exp_avg/exp_avg_sq + LR +
+  train state），不是旧估的 5.3 GB。`XRL_DCP_CKPT_INTERVAL=3`：40 窗落
+  step 3,6,…,39 共 13 份加末尾 step40。
+- 末尾份 `last_save_model_only=False`（recipe 已设），故 step40 也含优化器/LR/
+  train state，可直接 resume；两臂仅末尾份改全量合计多约 8.8 GB。
+- **容量红线**：/data00 可用约 177 GB。两臂若把里程碑 DCP 全留（interval=3
+  每臂 step 3…39 共 13 份加末尾 step40 ≈ 14 份 × 7.25 GiB，两臂），实测约
+  **190 GB 超盘**。稳态靠 `checkpoint_keep=2` 自动滚动（每臂 ~14.5 GB，写下
+  一份瞬时 +7.25）；**里程碑不许全留**。
+- 中途清理口径（与 weight-retention 一致，删前先报分数表）：
+  - 每个评测点导出 HF 到 `best`/`evalckpt`、跑完评测并记录分数后，只保留最近
+    2 份可 resume DCP；更早的中间 DCP 删除。
+  - 确需留某个里程碑（如 step20）时，最多留 1 份，并在跨过下一评测点后删除
+    上一里程碑，使任一时刻 DCP 总量 ≤ 3 份/臂。
+  - 巡检用 `deploy/3fs-v100/63_storage_watch.py`（默认根已改本地；
+    `XRL_WINDOW_GB=0.3` 只盯异常增长），余量 < 一窗 exit 1。
+
 ---
 
 ## 6. 前置依赖：T7（热启动题目重放修复）
@@ -437,21 +460,25 @@ export MESHY_SGLANG_SM70=1 MESHY_SM70_FLASH_DECODE=1
 export XRL_DCP_CKPT_INTERVAL=3
 ```
 
-第 5 步 gating smoke（只 DAPO 配方，2 窗，无评测）：
+第 5 步 gating smoke（只 DAPO 配方，2 窗，无评测）。树里只有一份 `recipe/grpo_math_v100.py`，
+DAPO 三件套由 `XRL_DYNAMIC_SAMPLING=1 XRL_OVERLONG_SHAPING=1` 开启（GRPO 臂两者留 0）：
 
 ```bash
 XRL_STEPS=2 XRL_EVAL_EVERY=99 XRL_RUN_TAG=math-dapo-smoke \
-  python scripts/launch.py --recipe recipe.math_dapo_v100
-# 然后读 $(XRL_RUNTIME_DIR 或 /3fs/.../rollout/math-dapo-smoke)/rollout_window_stats.jsonl
+  XRL_DYNAMIC_SAMPLING=1 XRL_OVERLONG_SHAPING=1 \
+  python scripts/launch.py --recipe recipe.grpo_math_v100
+# 然后读 $(XRL_RUNTIME_DIR 或 /data00/meshy/store/rollout/math-dapo-smoke)/rollout_window_stats.jsonl
 # 取 kind=dynamic 的 prompts_drawn/filtered_ratio，配合 timer 日志的生成/训练墙钟，按 §3.2 表定 N
 ```
 
-正式两臂（N 用 gating 结论，40 或 20）：
+正式两臂（N 用 gating 结论，40 或 20；正式启动走 v100_run_rl.sh + XRL_RECIPE=grpo_math_v100，
+下面直接列 launch.py 仅示意自变量）：
 
 ```bash
 XRL_STEPS=40 XRL_RUN_TAG=math-grpo-40w \
-  python scripts/launch.py --recipe recipe.math_grpo_v100
+  python scripts/launch.py --recipe recipe.grpo_math_v100
 XRL_STEPS=40 XRL_RUN_TAG=math-dapo-40w \
-  python scripts/launch.py --recipe recipe.math_dapo_v100
+  XRL_DYNAMIC_SAMPLING=1 XRL_OVERLONG_SHAPING=1 \
+  python scripts/launch.py --recipe recipe.grpo_math_v100
 # 降 20 窗时四条 XRL_STEPS=40 改 20、run tag 改 -20w，评测 XRL_EVAL_N 与评测点两臂同步改
 ```

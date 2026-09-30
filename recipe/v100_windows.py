@@ -123,13 +123,30 @@ def run_tag() -> str:
     return os.path.basename(runtime) if runtime else "default"
 
 
+def recipe_name() -> str:
+    """Leaf recipe module name, matching each recipe's ``dump_folder`` segment.
+
+    Accepts either ``grpo_math_v100`` or the fully-qualified
+    ``recipe.grpo_math_v100`` that ``scripts/launch.py --recipe`` receives;
+    launch.py writes that back into ``XRL_RECIPE`` so direct launch.py calls
+    (the runbook smoke command) and v100_run_rl.sh resolve identically.
+    """
+    name = os.environ.get("XRL_RECIPE", "grpo_gsm8k_v100")
+    return name.rsplit(".", 1)[-1]
+
+
 def dcp_checkpoint_dir() -> str:
-    """Directory holding this run's ``step-N`` DCP checkpoints."""
-    storage_root = os.environ.get("XRL_STORAGE_ROOT", "/3fs/stage/meshy")
+    """Directory holding this run's ``step-N`` DCP checkpoints.
+
+    The recipe leaf name must match the recipe's own ``dump_folder`` segment
+    (``grpo_gsm8k_v100`` / ``grpo_math_v100``); hard-coding the GSM8K name made
+    a MATH arm's crash-resume unable to find its DCP under ``grpo_math_v100``.
+    """
+    storage_root = os.environ.get("XRL_STORAGE_ROOT", "/data00/meshy/store")
     ckpt_dir = os.environ.get(
         "XRL_CKPT_DIR", os.path.join(storage_root, "ckpt")
     )
-    return os.path.join(ckpt_dir, "grpo_gsm8k_v100", run_tag(), "checkpoint")
+    return os.path.join(ckpt_dir, recipe_name(), run_tag(), "checkpoint")
 
 
 def latest_dcp_step(root: str | None = None) -> int | None:

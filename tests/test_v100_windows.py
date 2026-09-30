@@ -370,3 +370,31 @@ def test_cross_epoch_reshuffle_stays_reproducible(monkeypatch, tmp_path):
     e1 = [int(epoch1.select(range(40, 100))[i]["answer"][5:]) for i in range(60)]
     e2 = [int(epoch2.select(range(0, 4))[i]["answer"][5:]) for i in range(4)]
     assert b1 == e1 + e2
+
+
+def test_dcp_checkpoint_dir_matches_recipe_segment(monkeypatch, tmp_path):
+    """dcp_checkpoint_dir leaf recipe segment must equal each recipe's
+    dump_folder, or a crashed MATH arm cannot find its DCP to resume."""
+    ck = tmp_path / "ck"
+    monkeypatch.setenv("XRL_CKPT_DIR", str(ck))
+    monkeypatch.setenv("XRL_RUN_TAG", "math-dapo-40w")
+    monkeypatch.setenv("XRL_RECIPE", "grpo_math_v100")
+    assert v100_windows.dcp_checkpoint_dir() == str(
+        ck / "grpo_math_v100" / "math-dapo-40w" / "checkpoint"
+    )
+    monkeypatch.setenv("XRL_RECIPE", "grpo_gsm8k_v100")
+    monkeypatch.setenv("XRL_RUN_TAG", "gsm-run")
+    assert v100_windows.dcp_checkpoint_dir() == str(
+        ck / "grpo_gsm8k_v100" / "gsm-run" / "checkpoint"
+    )
+
+
+def test_dcp_checkpoint_dir_accepts_fully_qualified_recipe(monkeypatch, tmp_path):
+    """launch.py receives recipe.grpo_math_v100; the leaf name must win even
+    if the dotted form reaches the resolver (it writes the leaf back)."""
+    monkeypatch.setenv("XRL_CKPT_DIR", str(tmp_path / "ck"))
+    monkeypatch.setenv("XRL_RUN_TAG", "r")
+    monkeypatch.setenv("XRL_RECIPE", "recipe.grpo_math_v100")
+    assert v100_windows.dcp_checkpoint_dir().endswith(
+        "grpo_math_v100/r/checkpoint"
+    )

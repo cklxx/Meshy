@@ -93,7 +93,7 @@ def _weights_dir(root: str) -> str:
 
 
 def _milestone_dir(root: str) -> str:
-    return os.path.join(os.environ.get("XRL_CKPT_DIR", "/3fs/stage/meshy/ckpt"),
+    return os.path.join(os.environ.get("XRL_CKPT_DIR", "/data00/meshy/store/ckpt"),
                         os.path.basename(root.rstrip("/")))
 
 

@@ -181,7 +181,7 @@ MAX_NEW_TOKENS = int(os.environ.get("XRL_MAX_NEW_TOKENS", "4096"))
 # ckpt/, the runtime root (weights + rollout trajectories) under rollout/.
 # Set XRL_STORAGE_ROOT to a local path to run without 3FS; per-dir overrides
 # via XRL_CKPT_DIR / XRL_ROLLOUT_DIR take precedence.
-STORAGE_ROOT = os.environ.get("XRL_STORAGE_ROOT", "/3fs/stage/meshy")
+STORAGE_ROOT = os.environ.get("XRL_STORAGE_ROOT", "/data00/meshy/store")
 CKPT_DIR = os.environ.get("XRL_CKPT_DIR", os.path.join(STORAGE_ROOT, "ckpt"))
 ROLLOUT_DIR = os.environ.get("XRL_ROLLOUT_DIR", os.path.join(STORAGE_ROOT, "rollout"))
 
