@@ -8,7 +8,7 @@
 所有路径/默认值都已对齐当前 `v100/math`（含 HendrycksMATH、math_verify 判分、
 tuple 修复、空 gold 过滤）与 v100/rl 单卡 colocate 基建。
 
-> **冻结代码（v100/t11 @ origin）：`51f81a9`**。含 T11i（T7 prompt 游标、T5h
+> **冻结代码（v100/t11 @ origin）：`7d09613`**。含 T11i（T7 prompt 游标、T5h
 > fail-loud DCP、T5i slim trajectory、T11b tuple 判分修复）、T11f flash-decode
 > （`MESHY_SM70_FLASH_DECODE=1`、`XRL_DCP_CKPT_INTERVAL=3`，含 flash 接线/内核
 > 三件套的 sentinel 实证修复）、`_rollout_metrics` staticmethod NameError 修复、
