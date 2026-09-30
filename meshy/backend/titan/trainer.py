@@ -204,18 +204,17 @@ class TitanTrainer(ForgeEngine):
         apply_forge_engine_compat(job_config)
         super().__init__(job_config)
 
-        # Redirect synchronous DCP resume saves through a thread_count>1
-        # FileSystemWriter. thread_count=1 (torchtitan default) makes DCP use
-        # _OverlappingCpuLoader with non_blocking GPU->Host copies, which pin
-        # the full saved state; the CUDA host allocator then keeps ~10 GB of
-        # /dev/zero shared pages resident forever. See dcp_io.py.
+        # Redirect synchronous DCP resume saves through the bounded host-memory
+        # writer: no pinned non-blocking staging and no per-bucket tensor
+        # accumulation, so the save-window RSS increment is bounded (see
+        # dcp_io.py).
         if getattr(self.checkpointer, "enable", False):
             from meshy.backend.titan.dcp_io import (
-                make_unpinned_dcp_save,
+                make_bounded_dcp_save,
                 prune_incomplete_step_dirs,
             )
 
-            self.checkpointer.dcp_save = make_unpinned_dcp_save(
+            self.checkpointer.dcp_save = make_bounded_dcp_save(
                 self.checkpointer.dcp_save
             )
             pruned = prune_incomplete_step_dirs(self.checkpointer.folder)
