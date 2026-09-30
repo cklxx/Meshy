@@ -8,6 +8,12 @@
 所有路径/默认值都已对齐当前 `v100/math`（含 HendrycksMATH、math_verify 判分、
 tuple 修复、空 gold 过滤）与 v100/rl 单卡 colocate 基建。
 
+> **冻结代码（v100/t11 @ origin）：`c1638d2`**。含 T11i（T7 prompt 游标、T5h
+> fail-loud DCP、T5i slim trajectory、T11b tuple 判分修复）、T11f flash-decode
+> （`MESHY_SM70_FLASH_DECODE=1`、`XRL_DCP_CKPT_INTERVAL=3`）与 `_rollout_metrics`
+> staticmethod NameError 修复。冒烟部署树按 docs/sm70_flash_decode_integration.md
+> 以 merge 方式更新到此 hash，不用 rsync。partial rollout 刻意不在树上，两臂均不开。
+
 ---
 
 ## 0. 一句话实验
