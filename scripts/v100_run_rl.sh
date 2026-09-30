@@ -46,6 +46,11 @@ export PYTHONPATH=/data00/meshy/rl/meshy
 # wasted ~1.6 GiB on a 31 GiB host. TQ storage is dict-backed (measured RSS
 # ~23 MiB), so prealloc needs no shrink even at a 512-sample window.
 export XRL_TQ_STORAGE_UNITS=1
+# Slim two-tier trajectory audit log (T5i): ~240 B/sample structured record +
+# 16 full dialogues/window, append-only, ~454 KB/window. Default is already on;
+# exported explicitly so the launch log line (slim=True) is self-documenting.
+: "${XRL_TRAJ_SLIM:=1}"
+export XRL_TRAJ_SLIM
 # Fresh timestamped dir per run; a caller resuming from a DCP checkpoint pins
 # XRL_RUNTIME_DIR to the original run so trajectories/TB/eval keep appending
 # there and XRL_RUN_TAG points at that run's checkpoint folder.
