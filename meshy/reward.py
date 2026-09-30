@@ -27,6 +27,7 @@ from typing import Any, Iterable
 __all__ = [
     "response_length",
     "soft_overlong_penalty",
+    "dapo_overlong_penalty",
 ]
 
 
@@ -90,3 +91,49 @@ def soft_overlong_penalty(
         return float(reward)
     penalty = (expected - length) / buffer_len * penalty_factor
     return float(reward) + max(penalty, -penalty_factor)
+
+
+def dapo_overlong_penalty(
+    reward: float,
+    sample: Any,
+    *,
+    max_response_len: int = 4096,
+    cache_len: int = 1024,
+) -> float:
+    """DAPO overlong reward shaping with a hard truncated penalty.
+
+    Piecewise penalty subtracted from the 0/1 correctness reward:
+
+    * ``length <= L_max - L_cache``: no penalty;
+    * inside the soft buffer ``(L_max - L_cache, L_max)``: linear penalty
+      ramping 0 -> 1, ``(length - (L_max - L_cache)) / L_cache``;
+    * ``length >= L_max`` or the response was truncated
+      (``sample.truncated``): penalty 1.
+
+    A response cut at the cap is wrong-shaped by definition, so it loses the
+    full unit whether or not its final answer happened to parse; the explicit
+    ``truncated`` stamp is what catches a response that stopped exactly on the
+    boundary. Defaults L_max=4096 / L_cache=1024 per the MATH DAPO config.
+
+    Unlike :func:`soft_overlong_penalty` this is an additive *subtraction in
+    [0, 1]* matched to a 0/1 task reward, not the factor-scaled tapering used by
+    the ±1 long-context recipes. Gated on/off by the recipe
+    (``XRL_OVERLONG_SHAPING``); when unset the rollout leaves the reward alone.
+    """
+    max_response_len = int(max_response_len)
+    cache_len = int(cache_len)
+    if cache_len <= 0:
+        raise ValueError("dapo_overlong_penalty requires cache_len > 0")
+    soft_start = max_response_len - cache_len
+    length = response_length(sample.masks)
+
+    # A cut-off response pays the full unit regardless of its measured length.
+    if bool(getattr(sample, "truncated", False)):
+        penalty = 1.0
+    elif length <= soft_start:
+        return float(reward)
+    elif length >= max_response_len:
+        penalty = 1.0
+    else:
+        penalty = (length - soft_start) / cache_len
+    return float(reward) - max(0.0, min(1.0, penalty))

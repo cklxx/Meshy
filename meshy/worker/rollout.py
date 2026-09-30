@@ -195,6 +195,9 @@ class RolloutWorker(TQWorker):
         advantage_kwargs: dict[str, Any] | None = None,
         filter_zero_std_groups: bool = False,
         oversample_factor: float = 1.0,
+        dynamic_sampling: bool = False,
+        dynamic_target_groups: int | None = None,
+        dynamic_max_prompts: int | None = None,
         num_epochs: int = 1,
         pacing_window: int | str | None = 1,
         max_running_requests: int = -1,
@@ -256,7 +259,32 @@ class RolloutWorker(TQWorker):
             fields = fields + (RAW_REWARD_FIELD,)
         self.rollout_fields = fields
         self.advantage_kwargs = dict(advantage_kwargs or {})
-        self.filter_zero_std_groups = bool(filter_zero_std_groups)
+        self.dynamic_sampling = bool(dynamic_sampling)
+        # Dynamic sampling and the legacy per-epoch filter both call
+        # is_zero_variance_group but enforce different refill/cap semantics;
+        # they never run together (dynamic drives its own window loop).
+        self.filter_zero_std_groups = bool(filter_zero_std_groups) and not self.dynamic_sampling
+        groups_per_window, rem = divmod(self.train_batch_size, self.group_size)
+        if rem:
+            raise ValueError(
+                "train_batch_size must be a multiple of group_size "
+                f"({self.train_batch_size} % {self.group_size} = {rem})"
+            )
+        self.dynamic_target_groups = (
+            int(dynamic_target_groups) if dynamic_target_groups is not None else groups_per_window
+        )
+        if self.dynamic_target_groups <= 0:
+            raise ValueError("dynamic_target_groups must be positive")
+        # Hard ceiling on prompts drawn in one window (kept + dropped); default
+        # 3x the target. Once reached the worker keeps zero-variance groups so
+        # the window still fills and the trainer is never starved.
+        self.dynamic_max_prompts = (
+            int(dynamic_max_prompts)
+            if dynamic_max_prompts is not None
+            else 3 * self.dynamic_target_groups
+        )
+        if self.dynamic_max_prompts < self.dynamic_target_groups:
+            raise ValueError("dynamic_max_prompts must be >= dynamic_target_groups")
         if oversample_factor < 1.0:
             raise ValueError("oversample_factor must be >= 1")
         # Replacement budget for groups dropped by ``filter_zero_std_groups``,
@@ -264,6 +292,10 @@ class RolloutWorker(TQWorker):
         self.oversample_factor = float(oversample_factor)
         self.groups_seen = 0
         self.groups_filtered = 0
+        # Dynamic-sampling per-window accounting (logged at each window close).
+        self.dynamic_windows = 0
+        self.dynamic_prompts_drawn_total = 0
+        self.dynamic_groups_dropped_total = 0
         self.num_epochs = int(num_epochs)
         self.pacing_window = None if pacing_window is None else int(pacing_window)
         self.max_running_requests = int(max_running_requests)
@@ -316,7 +348,10 @@ class RolloutWorker(TQWorker):
     async def run_async(self) -> None:
         await self.open_tq()
         try:
-            await self._run_rollouts()
+            if self.dynamic_sampling:
+                await self._run_dynamic_rollouts()
+            else:
+                await self._run_rollouts()
         finally:
             await self.close_tq()
 
@@ -517,6 +552,117 @@ class RolloutWorker(TQWorker):
             )
             return None
         return int(dataset_prompts * (self.oversample_factor - 1.0))
+
+    async def _rollout_groups_concurrent(
+        self, builder: Any, prompts: list[Any], semaphore: Any
+    ) -> list[list[Any]]:
+        """Generate one group per prompt, concurrently, in prompt order.
+
+        Every group is returned (the legacy filter is off on this path); the
+        caller decides whether a zero-variance group is kept or replaced.
+        """
+
+        async def one(prompt: Any) -> tuple[int, list[Any]]:
+            version = await self.acquire_generation_slot(self.group_size)
+            if semaphore is not None:
+                await semaphore.acquire()
+            try:
+                group = await self.rollout_group(builder, prompt, version)
+                return version, group
+            finally:
+                if semaphore is not None:
+                    semaphore.release()
+
+        return await asyncio.gather(*(one(p) for p in prompts))
+
+    def _refund_generation_slots(self, num_groups: int) -> None:
+        """Return pacing slots for groups that will never become training rows.
+
+        A dropped zero-variance group generated no data, so the samples it
+        reserved must not count against the gate budget -- otherwise the
+        replacement prompts could not be launched and the window would come out
+        short, starving the trainer under ``pacing_window=1``.
+        """
+        self.samples_started = max(0, self.samples_started - num_groups * self.group_size)
+
+    async def _run_dynamic_rollouts(self) -> None:
+        """Per-window DAPO dynamic sampling.
+
+        Each window draws until it holds exactly ``dynamic_target_groups``
+        informative groups. A zero-variance group is dropped and its pacing
+        slots refunded so replacement prompts launch inside the same gate. The
+        anti-death-loop bound is a replacement budget of
+        ``dynamic_max_prompts - target`` dropped groups per window (3x target at
+        the default): once spent, zero-variance groups are kept and the window
+        fills unfiltered, so the trainer always receives a full window while
+        data remains and filtering can never spin forever.
+        """
+        from meshy.utils.sample import SampleBuilder
+
+        builder = SampleBuilder(self.model_path)
+        max_groups = (
+            max(1, math.ceil(self.max_running_requests / self.group_size))
+            if self.max_running_requests > 0
+            else None
+        )
+        semaphore = asyncio.Semaphore(max_groups) if max_groups is not None else None
+        replacement_budget = self.dynamic_max_prompts - self.dynamic_target_groups
+
+        for epoch in range(self.num_epochs):
+            if self.stopped:
+                break
+            dataset = self.dataset_factory(**self.dataset_kwargs)
+            while not self.stopped:
+                kept: list[tuple[int, list[Any]]] = []
+                window_dropped = 0
+                window_drawn = 0
+                first_draw = True
+                while len(kept) < self.dynamic_target_groups:
+                    deficit = self.dynamic_target_groups - len(kept)
+                    prompts = dataset.take_prompts(
+                        builder, deficit, window_start=first_draw
+                    )
+                    first_draw = False
+                    if not prompts:
+                        break
+                    results = await self._rollout_groups_concurrent(builder, prompts, semaphore)
+                    results = [r for r in results if r[1] is not None]
+                    window_drawn += len(results)
+                    for version, group in results:
+                        may_drop = window_dropped < replacement_budget
+                        if may_drop and is_zero_variance_group(group):
+                            window_dropped += 1
+                            self.groups_filtered += 1
+                            self._refund_generation_slots(1)
+                            continue
+                        kept.append((version, group))
+
+                if not kept:
+                    logger.info(
+                        "RolloutWorker dataset exhausted (dynamic epoch {}); "
+                        "{} groups filtered of {} seen",
+                        epoch, self.groups_filtered, self.groups_seen,
+                    )
+                    from meshy.service.failfast import publish_done
+
+                    publish_done("rollout")
+                    return
+
+                for version, group in kept:
+                    await self._write_rollout_group(group, version)
+
+                self.dynamic_windows += 1
+                self.dynamic_prompts_drawn_total += window_drawn
+                self.dynamic_groups_dropped_total += window_dropped
+                filtered_ratio = window_dropped / window_drawn if window_drawn else 0.0
+                logger.info(
+                    "RolloutWorker dynamic window {}: {} valid groups / {} prompts "
+                    "({} samples), dropped {} zero-variance groups, filtered_ratio={:.3f}"
+                    .format(
+                        self.dynamic_windows, len(kept), window_drawn,
+                        len(kept) * self.group_size, window_dropped, filtered_ratio,
+                    )
+                )
 
     async def _run_rollouts(self) -> None:
         from meshy.utils.sample import SampleBuilder

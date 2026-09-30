@@ -72,5 +72,56 @@ class Dataset:
         self.index += self.batch_size
         return [self.apply_chat_template(data, builder) for data in batch_data]
 
+    def take_prompts(
+        self, builder: SampleBuilder, n: int, *, window_start: bool = False
+    ) -> List[Sample]:
+        """Return up to ``n`` prompts and advance the stream position by that many.
+
+        Unlike :meth:`next_batch` this is not bounded by ``batch_size`` and does
+        not interact with any subclass per-window run counter: DAPO dynamic
+        sampling uses it to draw *replacement* prompts after dropping a
+        zero-variance group, so a discarded prompt still advances the data
+        position (no prompt is ever served twice). ``window_start`` marks the
+        first draw of a window (replacement draws pass False), which a
+        run-length-bounded subclass uses to count windows rather than draws.
+        ``wrap_epochs`` reshuffles a short tail across the epoch boundary;
+        without it the returned list is simply short when the split runs out.
+        """
+        if n <= 0:
+            return []
+        if window_start and not self.begin_window():
+            # A run-length-bounded dataset declines the next window outright.
+            return []
+        if not self.wrap_epochs:
+            total = len(self._base_dataset)
+            take = min(n, total - self.index)
+            if take <= 0:
+                return []
+            data = self.dataset.select(range(self.index, self.index + take))
+            self.index += take
+            return [self.apply_chat_template(row, builder) for row in data]
+
+        rows: List[dict] = []
+        total = len(self._base_dataset)
+        while len(rows) < n:
+            take = min(n - len(rows), total - self.index)
+            rows.extend(self.dataset.select(range(self.index, self.index + take)))
+            self.index += take
+            if self.index >= total:
+                self._apply_epoch(self.epoch + 1)
+                self.index = 0
+        return [self.apply_chat_template(row, builder) for row in rows]
+
+    def begin_window(self) -> bool:
+        """Reserve one output window before its first prompt draw.
+
+        Base streams are unbounded and always accept. A subclass that bounds the
+        run length (e.g. the V100 recipe's ``BoundedGSM8K``) overrides this to
+        consume one window of budget and return False when the run is over, so
+        the dynamic-sampling path -- which draws several times per window --
+        counts windows rather than individual draws.
+        """
+        return True
+
     def apply_chat_template(self, data: dict, builder: SampleBuilder) -> Sample:
         raise NotImplementedError

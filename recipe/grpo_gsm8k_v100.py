@@ -140,6 +140,14 @@ class BoundedGSM8K(GSM8K):
         self._batches_left -= 1
         return super().next_batch(builder)
 
+    def begin_window(self) -> bool:
+        # Dynamic-sampling path: reserve one output window on its first draw,
+        # so replacement draws inside the window do not consume run length.
+        if self._batches_left <= 0:
+            return False
+        self._batches_left -= 1
+        return True
+
 MODEL_PATH = os.environ.get("XRL_MODEL", "/data00/meshy/models/Qwen3-0.6B")
 # Inference boots from the restored step's exported HF weights on a DCP resume
 # so genesis weights match the trainer (otherwise the first resumed window is
@@ -312,33 +320,49 @@ def _training_config() -> TrainingServiceConfig:
 
 
 def _rollout_group() -> ServiceGroup:
+    # DAPO overlong reward shaping (XRL_OVERLONG_SHAPING=1): subtract a linear
+    # 0->1 penalty inside [L_max-L_cache, L_max) and a full 1 when truncated.
+    # Off by default; when off the reward stays the raw 0/1 score bit-for-bit.
+    overlong_shaping = os.environ.get("XRL_OVERLONG_SHAPING", "0") == "1"
+    rollout_kwargs = dict(
+        model_path=MODEL_PATH,
+        dataset="recipe.grpo_gsm8k_v100:BoundedGSM8K",
+        dataset_kwargs={"batch_size": ROLLOUT_BATCH, "split": "train", "seed": 42},
+        reward="meshy.dataset.gsm8k:GSM8K.reward",
+        sampling_params={
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "max_new_tokens": MAX_NEW_TOKENS,
+        },
+        group_size=GROUP_SIZE,
+        poll_interval=2.0,
+        pacing_window=1,
+        num_epochs=int(os.environ.get("XRL_EPOCHS", "1")),
+        # In-loop holdout (200x1 at v0/50/.../250), milestone copy and
+        # old-version pruning. Fires on the first group after each new
+        # weight grant, so eval runs under the exact version with the
+        # trainer blocked. v300 has no rollout window (the bounded dataset
+        # serves exactly 300 batches), so its 200x4 eval is standalone.
+        version_hook="recipe.v100_inloop:version_hook",
+    )
+    # DAPO dynamic sampling (XRL_DYNAMIC_SAMPLING=1): drop zero-variance groups
+    # and refill each 64-group window from fresh prompts, capped at 3x prompts.
+    # Off -> the legacy (no-filter) path is unchanged.
+    if os.environ.get("XRL_DYNAMIC_SAMPLING", "0") == "1":
+        rollout_kwargs["dynamic_sampling"] = True
+    if overlong_shaping:
+        rollout_kwargs["reward_shaping"] = "meshy.reward:dapo_overlong_penalty"
+        rollout_kwargs["reward_shaping_kwargs"] = {
+            "max_response_len": int(os.environ.get("XRL_OVERLONG_L_MAX", str(MAX_NEW_TOKENS))),
+            "cache_len": int(os.environ.get("XRL_OVERLONG_L_CACHE", "1024")),
+        }
     return ServiceGroup(
         id="rollout",
         n_replicas=1,
         n_gpus_per_replica=0,
         wait_until=["actor_train", "actor_infer"],
-        config=RolloutServiceConfig(
-            model_path=MODEL_PATH,
-            dataset="recipe.grpo_gsm8k_v100:BoundedGSM8K",
-            dataset_kwargs={"batch_size": ROLLOUT_BATCH, "split": "train", "seed": 42},
-            reward="meshy.dataset.gsm8k:GSM8K.reward",
-            sampling_params={
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": -1,
-                "max_new_tokens": MAX_NEW_TOKENS,
-            },
-            group_size=GROUP_SIZE,
-            poll_interval=2.0,
-            pacing_window=1,
-            num_epochs=int(os.environ.get("XRL_EPOCHS", "1")),
-            # In-loop holdout (200x1 at v0/50/.../250), milestone copy and
-            # old-version pruning. Fires on the first group after each new
-            # weight grant, so eval runs under the exact version with the
-            # trainer blocked. v300 has no rollout window (the bounded dataset
-            # serves exactly 300 batches), so its 200x4 eval is standalone.
-            version_hook="recipe.v100_inloop:version_hook",
-        ),
+        config=RolloutServiceConfig(**rollout_kwargs),
     )
 
 

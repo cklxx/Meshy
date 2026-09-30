@@ -293,6 +293,23 @@ class RolloutServiceConfig(ServiceConfig):
     #: epoch); 2.0 is the recipe's 2x oversampling budget. Inert when
     #: ``filter_zero_std_groups`` is False.
     oversample_factor: float = 1.0
+    #: DAPO dynamic sampling (``XRL_DYNAMIC_SAMPLING=1``): drop every group of
+    #: GROUP_SIZE answers whose *raw* reward has zero variance and keep drawing
+    #: fresh prompts until the window holds exactly ``target_valid_groups``
+    #: informative groups. Unlike ``filter_zero_std_groups`` this refills a
+    #: window to a fixed valid count (a dropped group returns its pacing slot, so
+    #: the budget is spent on the replacement rather than lost) and bounds the
+    #: draw with a hard per-window cap so a run cannot loop on an easy stretch.
+    #: False keeps the pre-existing per-epoch filter behaviour bit-identical.
+    dynamic_sampling: bool = False
+    #: Number of valid (non-dropped) groups a window must contain. Defaults to
+    #: the prompts-per-window ``train_batch_size // group_size``.
+    dynamic_target_groups: int | None = None
+    #: Hard cap on prompts drawn per window, including dropped ones. The cap is
+    #: the anti-death-loop bound; when hit, remaining groups are kept even if
+    #: zero-variance so the trainer still receives a full window. None -> 3x
+    #: target groups (the DAPO oversample ceiling).
+    dynamic_max_prompts: int | None = None
     sampling_params: dict[str, Any] = field(default_factory=dict)
     group_size: int = 1
     num_epochs: int = 1
