@@ -315,6 +315,72 @@ OOM；一旦 smoke 崩溃，先停下来修稳定性（§3.1 风险项），不�
 - smoke 结论（R、filtered_ratio、每窗生成/训练墙钟、推荐窗数）落一条记录，
   追加到本执行单末尾或 awb news，rl 据此启动；**该结论未出，40 窗不开跑**。
 
+#### 3.2.1 冒烟实测结果（2026-10-01，冻结树 5dc3605，已完成）
+
+DAPO 配方 `XRL_DYNAMIC_SAMPLING=1 XRL_OVERLONG_SHAPING=1`，3 窗（前两窗 +
+崩溃续跑第三窗），每窗 valid 64 组/512 样本：
+
+| 窗 | prompts_drawn | R=drawn/64 | dropped zero-var | filtered_ratio |
+|---|---|---|---|---|
+| 1 (v0) | 160 | 2.50 | 96 | 60.0% |
+| 2 (v1) | 168 | 2.63 | 104 | 61.9% |
+| 3 (v2，续跑) | 150 | 2.34 | 86 | 57.3% |
+
+R 稳定 **2.34–2.63（均 >2）**，零方差组约 60%（MATH 截断 38% + L4/L5 难题）。
+
+分项墙钟（单窗全循环）：
+- **生成**：纯 rollout 约 **61–87 min/窗**（窗1 72min 含 v0 inloop 5.4min；随
+  R≈2.5 放大；4096 长尾）。
+- **训练**（8 个优化更新，colocation grant→HF gather）：约 **23 min/窗**
+  （21m56 / 23m17 / 23m09）。
+- **DCP 落盘**（gather→step completed，含 HF 导出 ~4–5s）：约 **50 s/份**，
+  每份 7.3 GiB 本地盘（含 fp32 master + Adam exp_avg/exp_avg_sq + lr_scheduler
+  + train_state，`.metadata` 实证）。interval=3 时 40 窗 14 次 DCP 仅摊销
+  ~12 min，可忽略。
+- 峰值：host 最低可用 11.5 GB（31 GB 盒，未触发 earlyoom）；infer graph capture
+  后 GPU 最低可用 11.2 GB。`/data00` 增量：3 份 ckpt 22 GB + 单 run rollout
+  3.4 GB。
+
+infer 侧（加 `max_running_requests` 前）：DAPO 补样队列使 running-req 峰值
+**172**，超过 flash graph max_bs=64 的时间占 decode **28.7%**，超限回退 triton
+eager，吞吐 1254→957 tok/s（−24%），并伴 1 次可恢复 prefill OOM。→ 两臂统一
+`max_running_requests=64`（`XRL_MAX_RUNNING`，MATH recipe 默认 64），要求全程
+decode `cuda graph: True`。
+
+崩溃续跑演练（同 tag、STEPS=3、不设 START_WINDOW）通过：checkpointer 从 DCP
+folder 载入（非 HF/非 0）、gate version 0→2、infer 从 v2 权重 restore、colocate
+resume 后 graph capture 重建全部 12 个 flash plan（flash 仍 called）、step3 落
+全量 DCP、ignitor 报 Run completed cleanly。
+
+#### 3.2.2 最终拍板与 20 窗预注册规则（用户已拍板）
+
+**全量 MATH（不切 L1–3 子集），两臂各 20 窗冷启动**，DCP interval=3 可续到 40。
+
+- 两臂：`XRL_STEPS=20 seed=42` 冷启动 `start_window=0`；评测点 **v0/5/10/15/20**
+  各 MATH500 **500×4（max_new=4096，in-loop）**；`XRL_DCP_CKPT_INTERVAL=3`
+  且 **step20 必落**（interval 3 + 末尾步）。
+- GRPO 臂：`XRL_RUN_TAG=math-grpo20`，两个 DAPO env 留 0。
+- DAPO 臂：`XRL_RUN_TAG=math-dapo20`，`XRL_DYNAMIC_SAMPLING=1
+  XRL_OVERLONG_SHAPING=1`。
+- 两臂同 `XRL_MAX_RUNNING=64`、同几何（512/8，mtpm4096/seq64）、同评测点。
+- 串行：先 GRPO，放卡再 DAPO，同一张卡。
+
+**v20 判胜规则（跑完 v20 才按此判，不改阈值）：**
+1. **定胜负**：`Δ = lenient(v20_DAPO) − lenient(v20_GRPO) ≥ +3.0pp` **且**
+   DAPO 臂 v15→v20 不回落 → DAPO 胜（Δ≤−3pp 且 v30 同向为负时为 DAPO 负，
+   但 20 窗无 v30，故 20 窗只判正向胜/平/续跑）。
+2. **续到 40**：若任一臂 v15→v20 仍 **≥+1.5pp**，或 Δ 落在 **[+1.5,+3.0)pp**
+   → 两臂同 tag 改 `XRL_STEPS=40` 续跑（LR 恒定、warmup=0，续跑与一次性 40 窗
+   等价），补 v25/30/35/40 评测点再判。
+3. **判平**：其余情况（|Δ|<1.5pp 且两臂都已收敛）。
+
+**终点 8192 重评（评测侧，独立于 in-loop 4096）：** v0 基座、两臂终点各跑
+MATH500 500×4、`max_new_tokens=8192`，报 lenient/strict 与**截断拆分**（截断率
+骤降后未截断 acc 是否仍 v40/训练臂更高——用于区分能力 vs 被 4096 截断掩盖）。
+
+> 卡时提示：按实测生成 60–90min/窗 + 训练 23min/窗 + DCP~50s，单臂 20 窗约
+> 28–38 GPU 小时；两臂 + 评测点（5×500×4 flash 约 1h/次）合计约 70–90 GPU 小时。
+
 
 ---
 

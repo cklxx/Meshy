@@ -49,6 +49,14 @@ def test_dynamic_max_prompts_env_override_to_128(recipe, monkeypatch):
     assert cfg.dynamic_max_prompts == 128
 
 
+def test_inference_caps_running_requests_at_graph_max_bs(recipe, monkeypatch):
+    # Both arms share this; decode past bs=64 drops the flash CUDA graph.
+    monkeypatch.delenv("XRL_MAX_RUNNING", raising=False)
+    assert recipe._inference_config().server_args["max_running_requests"] == 64
+    monkeypatch.setenv("XRL_MAX_RUNNING", "48")
+    assert recipe._inference_config().server_args["max_running_requests"] == 48
+
+
 def test_both_arms_pin_clean40b_geometry_and_clip(recipe):
     # Shared by both arms from the one recipe; must match clean40b's init
     # (max_tokens_per_micro=4096, mini=64 -> 8 updates/512, seq_align=64).

@@ -184,6 +184,11 @@ def _inference_config() -> InferenceServiceConfig:
             "dtype": "half",
             "attention_backend": "triton",
             "sampling_backend": "pytorch",
+            # Cap in-flight requests at the flash decode CUDA-graph max batch.
+            # Without it DAPO's refill queue ran running up to ~172; decode past
+            # bs=64 falls back to triton eager (throughput 1254->957 tok/s) and
+            # pressured KV into one recoverable OOM. Same value both arms.
+            "max_running_requests": int(os.environ.get("XRL_MAX_RUNNING", "64")),
         },
     )
 
