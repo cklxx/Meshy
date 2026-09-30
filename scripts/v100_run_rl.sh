@@ -57,7 +57,9 @@ echo "TAG=$XRL_RUN_TAG STEPS=$XRL_STEPS ROLLOUT_BATCH=$XRL_ROLLOUT_BATCH GROUP=$
 echo "GRAPH=$MESHY_SM70_CUDA_GRAPH START=$(date +%s)"
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
 
-if $PY scripts/launch.py --recipe recipe.grpo_gsm8k_v100; then
+# Recipe module (default GSM8K; MATH GRPO-vs-DAPO sets XRL_RECIPE=grpo_math_v100).
+: "${XRL_RECIPE:=grpo_gsm8k_v100}"
+if $PY scripts/launch.py --recipe "recipe.${XRL_RECIPE}"; then
   echo "RL_DONE $(date +%s)"
 else
   rc=$?
