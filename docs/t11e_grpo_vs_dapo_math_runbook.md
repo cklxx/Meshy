@@ -359,12 +359,19 @@ resume 后 graph capture 重建全部 12 个 flash plan（flash 仍 called）、
 - 两臂：`XRL_STEPS=20 seed=42` 冷启动 `start_window=0`。**权威判定口径＝离线
   MATH500 500×4**（in-loop 评测器只支持 200×1，SE≈.034 判不了 3pp）：
   - **in-loop 200×1 保留**（每 5 窗自动跑），仅作快速过程曲线，不参与判胜负。
-  - **权威离线 500×4**：每臂跑完后对里程碑权重
-    `<runtime>/weights/actor_train-0/v{5,10,15,20}` 各跑
+  - **权威离线 500×4**：每臂跑完后对**里程碑副本**
+    `$XRL_CKPT_DIR/<runtime-basename>/step{5,10,15,20}` 各跑
     `scripts/eval_math.py --data math500 --samples 4 -n 500 --max-new-tokens 4096
     --temperature .6 --top-p .95 --top-k 20`（独立 flash+graph server，同硬门
-    协议），约 1h/点。HF 权重每个 train step 自动导出（fp16 1.2GB/个，**不被
-    DCP keep=2 prune**），里程碑无需另存 DCP；DCP 全量只留最近 2 份供续跑。
+    协议），约 1h/点。
+    - 里程碑由 `version_hook`（recipe/v100_inloop.py）在每个 eval 版本
+      v5/10/15/20 自动 **copytree** 出该版 fp16 HF 权重到 milestone 目录，独立
+      副本、不被 prune（`weights/vN` 每版导出但 keep=3 滚动，v5 会在 v8 被删，
+      故不能用 weights/vN，必须用 milestone stepN）。
+    - 注意 milestone 目录名是 **runtime basename**（如
+      `rl-math-grpo20-<ts>`），与 DCP 的 `<recipe>/<run_tag>/` 路径不同。
+    - DCP 全量（7.3GiB/份，供续跑）仍 keep=2 滚动；里程碑只是 fp16 HF
+      （~1.2GB/个），4 个/臂约 5GB，容量无忧。
   - **v0 基线**：基座在同一 flash+graph 路径重跑 500×4（两臂共用），替代早期
     triton 那份做严格配对。
   - 训练侧 `XRL_DCP_CKPT_INTERVAL=3`、**step20 必落**（interval 3 + 末尾步）。
