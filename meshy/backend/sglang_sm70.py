@@ -233,17 +233,29 @@ def _install_flash_decode_attention() -> None:
         use_pdl=False, page_size=1, score_mod=None, aux_tensors=None,
     ):
         # Eligibility guard — fall through to triton on anything the
-        # CUDA kernel does not cover. The KV pool may be either the 3-D
-        # token-major view [slots, kvh, d] (page_size=1) or the c128 4-D
-        # shared pool [pages, 16, kvh, d]; both reshape to
-        # [-1, kvh, d], and kv_indices already holds flat slots
-        # (page*16+tok for c128), so page_size is irrelevant here.
+        # CUDA kernel does not cover.
+        #
+        # Supported: the 3-D token-major pool [slots, kvh, d]
+        # (MHATokenToKVPool, nhd, page_size=1). kv_indices already holds
+        # flat token slots, so the kernel indexes it directly.
+        #
+        # NOT supported: the c128 PageMajorMHATokenToKVPool 4-D view. Its
+        # per-layer K/V is an as_strided, NON-contiguous tensor (K and V
+        # of every layer are interleaved inside each page), so a naive
+        # reshape(-1,...) would force a full-pool contiguous() copy on
+        # every decode (correct but OOM / bandwidth-collapse). Refuse it
+        # loudly instead of silently mis-indexing; supporting it needs
+        # explicit (stride_page, stride_tok) offset math in the kernel.
+        _nhd3 = (
+            k_buffer.dim() == 3 and v_buffer.dim() == 3
+            and k_buffer.is_contiguous() and v_buffer.is_contiguous()
+        )
         eligible = (
             not has_mla and logit_cap == 0.0 and sinks is None
             and xai_temperature_len == -1 and score_mod is None
             and aux_tensors is None
             and q.dim() == 3 and q.dtype == torch.float16
-            and k_buffer.dim() in (3, 4) and v_buffer.dim() == k_buffer.dim()
+            and _nhd3
             and k_buffer.shape[-1] == v_buffer.shape[-1] == q.shape[-1]
             and q.shape[-1] == _fd._HEAD_DIM
         )
@@ -264,11 +276,11 @@ def _install_flash_decode_attention() -> None:
             # context budget so the grid never changes under graph replay.
             plan = _fd.make_plan(h, kvh, d, m, max_ctx, q.device)
             plans[m] = plan
-            _mark(f"flash-called m={m} splits={plan.num_splits} "
-                  f"chunk={plan.chunk_tokens}")
+            _mark(f"flash-called m={m} dim3={k_buffer.dim()} "
+                  f"splits={plan.num_splits} chunk={plan.chunk_tokens}")
             logger.info(
                 "[sglang-sm70] flash-decode plan: batch=%d splits=%d "
-                "chunk=%d (max_ctx=%d)",
+                "chunk=%d (max_ctx=%d, layout=nhd3)",
                 m, plan.num_splits, plan.chunk_tokens, max_ctx)
 
         k_flat = k_buffer.reshape(-1, kvh, d)
