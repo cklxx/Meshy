@@ -22,8 +22,9 @@ tuple 修复、空 gold 过滤）与 v100/rl 单卡 colocate 基建。
 ## 0. 一句话实验
 
 在**完全相同**的模型/数据顺序/窗数/批大小/lr/长度/显存-图配置下，只切换
-RL 算法族 GRPO→DAPO 的三件套（去 std 归一化、零方差组动态补样、soft-overlong
-惩罚），用 MATH500 500×4 lenient 主指标判断 DAPO 在 MATH 上是否带来真实增益。
+RL 算法族 GRPO→DAPO 的两件套（零方差组动态补样、soft-overlong 惩罚），优势函数
+两臂**相同**（组内 `(r−mean)/std`；“去 std”是 Dr.GRPO 的做法，不是 DAPO 原文，
+见 §1.2），用 MATH500 500×4 lenient 主指标判断 DAPO 在 MATH 上是否带来真实增益。
 
 ---
 
@@ -50,7 +51,7 @@ RL 算法族 GRPO→DAPO 的三件套（去 std 归一化、零方差组动态�
 | 每窗 prompt 数 | **`XRL_ROLLOUT_BATCH=64`（env 覆盖值，不是 recipe 默认 8）** | clean40b 实测口径；启动命令必须显式带，见 §7 |
 | 每 prompt 采样数 | `GROUP_SIZE=8` | completions/prompt |
 | 每窗样本数 | **64 prompts × 8 = 512 样本/窗**（`BATCH_SIZE = ROLLOUT_BATCH*GROUP_SIZE = 512`） | clean40b trajectories 实测每 weight_version 恰 512 行（基线，未触发补样的窗） |
-| trainer batch | `BATCH_SIZE=512`，`mini_batch=8`（512/8=64 个优化 micro 推进/窗），micro=1 | 随 64×8 同步放大 |
+| trainer batch | `BATCH_SIZE=512`，`mini_batch=64`（512/64=**8 个优化更新/窗**），micro=1，per-token 微批 `max_tokens_per_micro=4096`，`seq_bucket=64`→seq_align=64 | 钉成 clean40b 实跑 init（mtpm4096/mini64/seq64），两臂相同；v100_run_rl.sh 在 MATH recipe 下强制 |
 | lr / schedule | `lr=1e-6`，weight_decay=0.1，max_norm=1.0，**warmup=0，lr_decay_ratio=0（常数）** | 40 窗太短，常数 lr，两臂一致 |
 | 训练精度 | `XRL_TRAIN_DTYPE=float32` master + fp16 FSDP compute + GradScaler | sm70 必需，勿用 uniform fp16 |
 | seq_len | `XRL_SEQ_LEN=5120` | 同 gsm8k |
@@ -63,32 +64,40 @@ RL 算法族 GRPO→DAPO 的三件套（去 std 归一化、零方差组动态�
 
 ### 1.2 唯一的自变量（两列 diff 表，只列不同行）
 
+DAPO 在本树由两个 env 开启（`recipe/grpo_math_v100.py` 唯一一份，两臂共用，
+受控量从该文件读同一组值）：`XRL_DYNAMIC_SAMPLING=1 XRL_OVERLONG_SHAPING=1`。
+
 | 配置行 | GRPO 臂 | DAPO 臂 |
 |---|---|---|
-| `filter_zero_std_groups` | `False` | `True`（动态采样：丢全对/全错组） |
-| `oversample_factor` | `1.0`（不补样） | `3.0`（3× 上限内补样，即最多再花 2× prompt） |
-| `advantage` | 默认 `meshy.worker.rollout:grpo_advantage`（`(r−mean)/std`） | `meshy.advantage:_2_6_math_reshaped_advantage`（**只减组均值，不除 std**） |
-| soft-overlong 惩罚 | 无（`buffer_len=0` → penalty 直通） | 开：见下方 L_max/L_cache |
-| length-reward 塑形 | 关（weight=0） | **关（weight=0）**——本实验不引入 length reward，只隔离 DAPO 的去-std+动态采样+overlong |
-| clip / TIS | `ppo_clip 0.2/0.28`、无 TIS | **完全相同**（clip-higher/TIS 不放进本次自变量，避免一次改 5 件事） |
+| 动态补样 | 关（每组跑完即止，R=1） | **开** `dynamic_sampling=True`：丢零方差（全对/全错）组并补样到固定有效组数 |
+| 补样硬上限 | 不适用 | `dynamic_max_prompts=192`（每窗 kept+dropped prompt 上限，=3×64 目标；env `XRL_DYNAMIC_MAX_PROMPTS`）。**真实生效的是它，不是 `oversample_factor`**（后者在 dynamic 路径不参与预算，见 rollout.py replacement_budget） |
+| `advantage` | `meshy.worker.rollout:grpo_advantage`（组内 `(r−mean)/std`） | **完全相同**（见下说明） |
+| soft-overlong 惩罚 | 关（reward 直通 0/1） | 开：reward_shaping=`meshy.reward:dapo_overlong_penalty`，见下 |
+| length-reward 塑形 | 关 | 关——本实验不引入 length reward，只隔离 动态补样 + overlong |
+| clip ε | `ppo_clip 0.2/0.28` | **完全相同** |
+| TIS | 无 | **完全相同**（clip-higher/TIS 不放本次自变量） |
+| PPO loss 聚合 | per-sequence（`advantage=column`，`calculate_per_token_loss=False`） | **完全相同**（同一份 trainer，非 token-level 平均） |
 
-**overlong 的 L_max / L_cache（仅 DAPO 臂）：**
-- `L_max = MAX_NEW_TOKENS = 4096`（响应长度上限）。
-- `L_cache = L_max − buffer_len`：软惩罚起始长度。DAPO 原文
-  `L_cache = L_max − L_max/4`，即 `buffer_len = L_max/4 = 1024`，
-  `L_cache = 3072`。
-- `OVERLONG_PENALTY_FACTOR=1.0`（长度到 L_max 时线性罚到 −1）。
-- 经 advantage_kwargs 传：`rollout_max_response_len=4096`、
-  `overlong_buffer_len=1024`、`overlong_penalty_factor=1.0`、
-  `length_reward_weight=0`。
+**为什么两臂 advantage 相同（不去 std）：** DAPO 原文（Yu et al. 2025）的优势仍是
+组内 `(r−mean)/std`；“去掉 std、只减均值”是 **Dr.GRPO** 的做法，不是 DAPO。另外
+树里的 `meshy.advantage:_2_6_math_reshaped_advantage` 自身再做一次 overlong，
+若与 `reward_shaping=dapo_overlong_penalty` 同用会**双重计数**超长惩罚。故两臂都用
+默认 `grpo_advantage`，overlong 只经 reward shaping 注入一次。
 
-> 落地注意：`filter_zero_std_groups`/`oversample_factor`/`advantage` 是
-> `RolloutServiceConfig` 的直接字段（已存在）；soft-overlong 走
-> `advantage_kwargs`（`_2_6_math_reshaped_advantage` 已读这三个键）。
-> 任务描述里的 `XRL_DYNAMIC_SAMPLING` / `XRL_OVERLONG_SHAPING` 开关**当前代码
-> 没有**——由 recipe 直接写上述 Python 字段实现，不必新造 env（若 rl 想要 env
-> 开关，在 common 里 `os.environ.get("XRL_DYNAMIC_SAMPLING","0")=="1"` 映射到这
-> 三个字段即可，但默认值必须两臂不同且写死，不能靠 shell 漏传）。
+**overlong 的 L_max / 缓冲（仅 DAPO 臂，`dapo_overlong_penalty`）：**
+- `max_response_len = L_max = 4096`（响应长度上限）。
+- `cache_len = 1024` 是**末尾软惩罚缓冲宽度**（不是起点）：软罚区为
+  `(L_max−cache_len, L_max) = (3072, 4096)`。长度 ≤3072 不罚；进入 (3072,4096)
+  线性加罚 `(len−3072)/1024`，0→1；长度 ≥4096 或被截断（`sample.truncated`）硬罚 1
+  （被截的回答无论 boxed 是否可解析都按错塑形）。
+- 经 `reward_shaping_kwargs` 传：`max_response_len=4096`、`cache_len=1024`
+  （env `XRL_OVERLONG_L_MAX` / `XRL_OVERLONG_L_CACHE`）。
+
+> 落地（已在 recipe 实现）：`XRL_DYNAMIC_SAMPLING=1` →
+> `dynamic_sampling=True` + `dynamic_max_prompts`（env `XRL_DYNAMIC_MAX_PROMPTS`，
+> 默认 192）；`XRL_OVERLONG_SHAPING=1` →
+> `reward_shaping="meshy.reward:dapo_overlong_penalty"` + 上述 kwargs。GRPO 臂两个
+> env 都留 0。优势、clip、loss、训练几何两臂从同一 recipe 取同值。
 
 ---
 
@@ -132,7 +141,8 @@ train holdout 会和训练 prompt 撞。
 **评测协议（两臂逐字相同）：**
 - 采样：Qwen3 thinking，temp 0.6 / top_p 0.95 / top_k 20，**每题 4 个样本**
   （500×4 = 2000 请求），`max_new_tokens=4096`（in-loop 口径，不是 endpoint
-  的 8192；4096 已覆盖 p95 思考长度）。
+  的 8192；**4096 只覆盖到约 p62**——基座 500×4 实测截断率 37.9%、p90 已顶
+  4096，并非“覆盖 p95”）。
 - 判分：lenient（math_verify 等价）为主，strict（规范化字符串）为辅，都报；
   同时报 boxed format rate 与 truncation rate。
 - 主指标：**lenient 逐题平均正确率**（200×4/500×4 同一口径）；pass@1..8 也出
@@ -237,7 +247,7 @@ clean40b（GSM8K，512 样本/窗，单卡同配置，triton）实测**每窗墙
 
 - **GRPO 臂（triton 上界）**：约 20.5 分/窗 × 40 ≈ **13.7 GPU 小时**（MATH
   输出更长，生成段按 1.2–1.5× 估 ≈ **16–20 GPU 小时**；flash 落地后下修）。
-- **DAPO 臂（triton 上界）**：`oversample_factor=3` 允许每窗最多生成 3×
+- **DAPO 臂（triton 上界）**：`dynamic_max_prompts=192` 允许每窗最多发起 3×
   prompt 补零方差组，最坏生成段 14.5×3 ≈ 43.5 分/窗，40 窗 ≈ **29+ GPU
   小时**；加 GRPO 臂与两臂评测 4–5h，triton 口径总墙钟逼近或超 40 GPU 小时。
 - clean40b 轨迹里 2/40 round（v10/v20）记了 512×2~3 行，已查实是**两次崩溃
@@ -289,13 +299,13 @@ OOM；一旦 smoke 崩溃，先停下来修稳定性（§3.1 风险项），不�
 
 | 实测 R（两窗） | filtered_ratio | 决定 |
 |---|---|---|
-| **R ≤ 1.5**（均值，且单窗 ≤1.5） | 约 ≤1/3 | **40 窗可行**，oversample 保持 3（上限用不满没关系）；按 §3.1 重算总卡时确认 ≤ 预算后开跑 |
+| **R ≤ 1.5**（均值，且单窗 ≤1.5） | 约 ≤1/3 | **40 窗可行**，`XRL_DYNAMIC_MAX_PROMPTS=192`（R 上限 3）保持，上限用不满没关系；按 §3.1 重算总卡时确认 ≤ 预算后开跑 |
 | **1.5 < R ≤ 2.0** | 约 1/3–1/2 | 两臂**同时降到 20 窗**（保持 512 样本/窗、同评测点比例 v0/5/10/15/20），或保持 40 窗但确认总卡时可接受；二选一在量完当场定，倾向 20 窗 |
-| **R > 2.0**（接近 3 上限） | >1/2 | 把 `oversample_factor` **两臂无关——只 DAPO** 降到 2，重跑 2 窗复量；若仍 >2，降到 20 窗且 oversample=2 |
+| **R > 2.0**（接近 3 上限） | >1/2 | 把 **DAPO 单侧**的 `XRL_DYNAMIC_MAX_PROMPTS` 从 192 降到 **128**（R 上限 3→2），重跑 2 窗复量；若仍 >2，再降到 20 窗 |
 
-> 注意：oversample/filter 是 **DAPO 单侧自变量**，GRPO 臂永远
-> filter_zero_std_groups=False、R=1.0，不补样。表里"两臂同时改"只针对**窗数**
-> 这种受控量；oversample_factor 只调 DAPO。
+> 注意：动态补样/overlong 是 **DAPO 单侧自变量**，GRPO 臂永远
+> `XRL_DYNAMIC_SAMPLING=0`、R=1.0，不补样。表里“两臂同时改”只针对**窗数**
+> 这种受控量；补样上限 `XRL_DYNAMIC_MAX_PROMPTS` 只调 DAPO。
 
 **判定纪律：**
 - 2 窗样本极小，早期窗又最难（基座全错组最多），R 可能是全程上界，所以阈值
@@ -331,7 +341,7 @@ OOM；一旦 smoke 崩溃，先停下来修稳定性（§3.1 风险项），不�
   偶然跳变）。同时报告成本：若 Δ 达标但 DAPO 多耗 >50% GPU 小时，结论记为
   "赢但不划算"，分开写。
 - **平**：|Δ(v40)| < 3.0 个百分点，或方向在 v20/v30/v40 反复变号。结论：DAPO
-  三件套在 MATH 40 窗上无可测增益，不默认开启。
+  两件套（动态补样 + overlong；优势两臂相同）在 MATH 40 窗上无可测增益，不默认开启。
 - **DAPO 输**：v40 处 Δ ≤ −3.0 个百分点（且非单点噪声：v30 同向）。需排查是否
   overlong 惩罚误伤正确长答案（看 truncation/format rate 与 raw_reward 曲线）。
 
@@ -383,7 +393,15 @@ OOM；一旦 smoke 崩溃，先停下来修稳定性（§3.1 风险项），不�
    后续步骤**。结论落 awb news。
 6. **【第二硬门】基座过线后跑 §3.2 的 DAPO 2 窗计量**（独立 smoke tag，
    RL_STEPS=2，不开启评测），读出 R / filtered_ratio / 每窗生成与训练墙钟，
-   按 §3.2 表当场定 N（40 或 20）与是否降 oversample；结论落 awb news。
+   按 §3.2 表当场定 N（40 或 20）与是否降 `XRL_DYNAMIC_MAX_PROMPTS`；结论落 awb news。
+   冒烟窗必须同时报（max_new=4096 不改，数据给用户定）：
+   - **训练侧截断率**（被 stamp `truncated` 的样本占比，区分评测截断）；
+   - **截断样本的 raw reward 分布**（截断几乎必为 0：评测测得截断样本 acc
+     base .009 / v40 .039）；
+   - **截断样本的重复退化比例**（`repetition` flag 命中）；
+   - **DAPO 两窗各自的 R**（`prompts_drawn/64`，取高窗对照阈值）；
+   - **|corr(raw_reward, shaped−raw)|**：overlong 惩罚与原始正确性的相关，
+     确认塑形作用在“长但错”而非“长但对”。
    **这一步未出结果，禁止进入第 7 步。**
 7. 按 GPU 队列申请（不自行 hold）；先跑 GRPO 臂还是 DAPO 臂由队列决定，但
    两臂用**同一张卡**（避免跨卡硬件差），run tag 分别 `math-grpo-{N}w` /
@@ -440,12 +458,17 @@ window 0，clean40b 实测 2634 次 prompt 使用只覆盖 896 道题（12%）�
 
 - 数据集/判分：`meshy/dataset/hendrycks_math.py`（HendrycksMATH / math_equiv /
   tuple 防护 / 空 gold 过滤）
-- GRPO advantage：`meshy/worker/rollout.py:grpo_advantage`
-- DAPO advantage+overlong：`meshy/advantage.py:_2_6_math_reshaped_advantage`、
-  `meshy/reward.py:soft_overlong_penalty`
-- 动态采样：`RolloutServiceConfig.filter_zero_std_groups` / `oversample_factor`，
+- 优势函数（**两臂相同**，不去 std）：`meshy/worker/rollout.py:grpo_advantage`
+  （组内 `(r−mean)/std`）。不用 `meshy/advantage.py:_2_6_math_reshaped_advantage`
+  （Dr.GRPO 去 std 路线，且自身再做 overlong 会与 reward shaping 双重计数）。
+- DAPO overlong：`meshy/reward.py:dapo_overlong_penalty`（软区 3072–4096，
+  truncated 硬罚；kwargs `max_response_len`/`cache_len`），由
+  `XRL_OVERLONG_SHAPING=1` 在 recipe 挂上 reward_shaping。
+- 动态采样：`RolloutServiceConfig.dynamic_sampling` + 硬上限 `dynamic_max_prompts`
+  （env `XRL_DYNAMIC_MAX_PROMPTS`，默认 192；`oversample_factor` 在 dynamic 路径
+  不生效，预算见 rollout.py 的 `replacement_budget=dynamic_max_prompts-target`）；
   rollout 逻辑在 `meshy/worker/rollout.py`（is_zero_variance_group /
-  _oversample_budget）；每窗指标（env T11d `8ec7b61`）写
+  _run_dynamic_rollouts）；每窗指标（env T11d `8ec7b61`）写
   `<runtime>/rollout_window_stats.jsonl`，字段
   `prompts_drawn/valid_groups/valid_samples/groups_dropped_zero_variance/
   refill_count/filtered_ratio`，并转训练日志 + TensorBoard。

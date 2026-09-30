@@ -152,9 +152,15 @@ def _trainer_config() -> TrainerConfig:
 
 
 def _trainer_params() -> TrainerParamsConfig:
-    mtpm = os.environ.get("XRL_MAX_TOKENS_PER_MICRO")
+    # Pinned to the values clean40b actually trained with (its 2026-09-29
+    # 17:02 TitanTrainer init): max_tokens_per_micro=4096 (per-token micro
+    # packing), mini_batch_size=64 (512/64 = 8 optimizer updates/window),
+    # seq_bucket=64 -> seq_align=64. Both GRPO and DAPO arms inherit identical
+    # values from this one recipe; the runbook launch exports them too so the
+    # shared v100_run_rl.sh defaults (gsm8k mini=8/seq=1024) cannot leak in.
+    mtpm = os.environ.get("XRL_MAX_TOKENS_PER_MICRO", "4096")
     params = dict(
-        mini_batch_size=int(os.environ.get("XRL_MINI_BATCH", "8")),
+        mini_batch_size=int(os.environ.get("XRL_MINI_BATCH", "64")),
         micro_batch_size=1,
         ppo_clip_eps_low=0.2,
         ppo_clip_eps_high=0.28,
@@ -163,7 +169,7 @@ def _trainer_params() -> TrainerParamsConfig:
     if mtpm:
         params["batch_layout"] = "padded"
         params["max_tokens_per_micro"] = int(mtpm)
-    params["seq_bucket"] = int(os.environ.get("XRL_SEQ_BUCKET", "1024"))
+    params["seq_bucket"] = int(os.environ.get("XRL_SEQ_BUCKET", "64"))
     return TrainerParamsConfig(**params)
 
 
@@ -213,6 +219,14 @@ def _rollout_group() -> ServiceGroup:
     )
     if os.environ.get("XRL_DYNAMIC_SAMPLING", "0") == "1":
         rollout_kwargs["dynamic_sampling"] = True
+        # This hard cap (kept+dropped prompts in one window), not
+        # oversample_factor, is the real refill ceiling in the dynamic path
+        # (rollout.py caps the replacement budget at max-target). 192 = 3x the
+        # 64-prompt target; the §3.2 decision to "cut oversample to 2" lowers
+        # this to 128. Overshoot keeps zero-variance groups so the window fills.
+        rollout_kwargs["dynamic_max_prompts"] = int(
+            os.environ.get("XRL_DYNAMIC_MAX_PROMPTS", "192")
+        )
     if overlong_shaping:
         rollout_kwargs["reward_shaping"] = "meshy.reward:dapo_overlong_penalty"
         rollout_kwargs["reward_shaping_kwargs"] = {

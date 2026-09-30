@@ -81,6 +81,21 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader
 
 # Recipe module (default GSM8K; MATH GRPO-vs-DAPO sets XRL_RECIPE=grpo_math_v100).
 : "${XRL_RECIPE:=grpo_gsm8k_v100}"
+# MATH arms pin the exact training micro geometry clean40b ran with (its
+# TitanTrainer init): per-token micro packing 4096, mini_batch 64 (8
+# updates/512-window), seq alignment 64. The generic defaults above are the
+# GSM8K/300-step values (mini 8, mtpm unset, seq 1024), so override them only
+# for the MATH recipe unless the caller set them on purpose.
+if [ "$XRL_RECIPE" = "grpo_math_v100" ]; then
+  : "${XRL_ROLLOUT_BATCH:=64}"
+  : "${XRL_GROUP_SIZE:=8}"
+  : "${XRL_MINI_BATCH:=64}"
+  : "${XRL_MAX_TOKENS_PER_MICRO:=4096}"
+  : "${XRL_SEQ_BUCKET:=64}"
+  export XRL_ROLLOUT_BATCH XRL_GROUP_SIZE XRL_MINI_BATCH \
+         XRL_MAX_TOKENS_PER_MICRO XRL_SEQ_BUCKET
+  echo "MATH_GEOM ROLLOUT_BATCH=$XRL_ROLLOUT_BATCH GROUP=$XRL_GROUP_SIZE WINDOW=$((XRL_ROLLOUT_BATCH*XRL_GROUP_SIZE)) MINI_BATCH=$XRL_MINI_BATCH UPDATES/WIN=$((XRL_ROLLOUT_BATCH*XRL_GROUP_SIZE/XRL_MINI_BATCH)) MAX_TOKENS_PER_MICRO=$XRL_MAX_TOKENS_PER_MICRO SEQ_BUCKET=$XRL_SEQ_BUCKET"
+fi
 if $PY scripts/launch.py --recipe "recipe.${XRL_RECIPE}"; then
   echo "RL_DONE $(date +%s)"
 else
