@@ -437,6 +437,19 @@ v100_run_rl.sh 显式 export，并在启动前 mkdir + 可写检查）。traject
   - 巡检用 `deploy/3fs-v100/63_storage_watch.py`（默认根已改本地；
     `XRL_WINDOW_GB=0.3` 只盯异常增长），余量 < 一窗 exit 1。
 
+### 5.2 成败判定：以 ignitor 日志为准，不以 `RL_FAIL`/退出码为准
+
+冒烟实测：训练全部 step 正常完成（DCP/HF 都落盘）后，torchtitan elastic 在
+**正常收尾终止服务**时会给 train rank 发 SIGKILL(-9)，`launch.py` 据此报
+`recipe FAILED`、`v100_run_rl.sh` 打印 `RL_FAIL rc=1`（其实是成功）。判定一次 run
+成败**只看 ignitor 日志** `Run completed cleanly; terminating services` +
+`.metadata`/weights 是否落盘；`RL_DONE`/`RL_FAIL` 与退出码不可靠。
+
+已核查：没有任何自动重跑/误触发链路依赖该退出码（crontab 空、无 supervisor 拉起
+RL）；消费 `RL_FAIL` 的只是人工一次性 watchdog（`run_watch2/3.sh`、
+`clean40_watch_remote.sh`、`ckpt_grab.sh`，不在仓库、只决定监视者退出码，不会
+重跑训练）。收尾信号处理（让正常完成退出 0）排到 T11 后修，不阻塞本次。
+
 ---
 
 ## 6. 前置依赖：T7（热启动题目重放修复）
