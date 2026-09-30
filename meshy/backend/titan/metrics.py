@@ -363,9 +363,11 @@ class TitanTrainer(_BackendTitanTrainer):
             # step and resumed on the next weights (Miles semantics).
             m["rollout/weight_version/mixed_version_ratio"] = _mean(mixed)
 
-        # Per-window rollout counters (dynamic sampling filtered_ratio, refill
-        # counts; partial-rollout deferrals) published by the rollout process.
-        self._attach_window_stats(m, current_version)
+        # Per-window rollout counters (dynamic-sampling filtered_ratio/refill,
+        # partial-rollout deferrals) are attached by the caller: this is a
+        # @staticmethod (unit-tested without an instance) and window stats come
+        # from the instance-backed reader; TitanTrainer.train_step calls
+        # self._attach_window_stats(m, current_version) after this returns.
 
         hist = {
             "rollout/response_lengths": response_lengths,
@@ -435,11 +437,15 @@ class TitanTrainer(_BackendTitanTrainer):
         multi-rank run reports the whole batch rather than rank zero's slice.
         """
         started = time.perf_counter()
+        cur_version = int(getattr(self, "step", 0))
         rollout, hist = self._rollout_metrics(
             rollout_samples if rollout_samples is not None else samples,
             self.seq_len,
-            current_version=int(getattr(self, "step", 0)),
+            current_version=cur_version,
         )
+        # Window stats read per-instance state, so they attach here, not in the
+        # static _rollout_metrics.
+        self._attach_window_stats(rollout, cur_version)
         result = dict(super().train_step(samples, plan=plan, step_schedule=step_schedule))
         metrics = dict(result)
         metrics.update(rollout)
