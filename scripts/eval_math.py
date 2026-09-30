@@ -175,6 +175,18 @@ def main() -> None:
     per_q_strict = {qi: [] for qi in range(n)}
     trunc = lengths = fmt = 0
     total = n * args.samples
+    # SGLang 0.5.18 on sm70 does not populate meta_info.output_token_length, so
+    # fall back through the usage block and finally to a tokenizer count.
+    counter_tok = AutoTokenizer.from_pretrained(args.model)
+
+    def _response_tokens(meta: dict, text: str) -> int:
+        usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+        for key in ("output_token_length", "completion_tokens", "output_tokens"):
+            v = meta.get(key) or usage.get(key)
+            if isinstance(v, (int, float)) and int(v) > 0:
+                return int(v)
+        return len(counter_tok.encode(text, add_special_tokens=False))
+
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as fh:
         for qi, resp in responses:
@@ -185,7 +197,7 @@ def main() -> None:
             meta = resp.get("meta_info") or {}
             if g._finish_type(meta) == "length":
                 trunc += 1
-            toks = meta.get("output_token_length") or 0
+            toks = _response_tokens(meta, text)
             lengths += int(toks)
             fmt += pred is not None
             per_q_lenient[qi].append(int(ok_l))
