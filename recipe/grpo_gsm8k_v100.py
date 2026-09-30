@@ -116,6 +116,7 @@ class BoundedGSM8K(GSM8K):
         seed: int | None = None,
         start_window: int | None = None,
         batches_this_run: int | None = None,
+        start_prompt: int | None = None,
         **kwargs,
     ):
         if start_window is None or batches_this_run is None:
@@ -123,12 +124,20 @@ class BoundedGSM8K(GSM8K):
             start_window = plan.start_window if start_window is None else start_window
             if batches_this_run is None:
                 batches_this_run = plan.batches_this_run
-        # One batch == one prompt window, so the global prompt offset is the
-        # starting window times prompts/batch (= ROLLOUT_BATCH).
+            # Only inherit the plan's prompt offset when the caller did not
+            # pin the window itself (the real rollout path); explicit callers
+            # (tests, eval) get the plain window*batch grid unless they ask.
+            if start_prompt is None and start_window is plan.start_window:
+                start_prompt = plan.start_prompt
+        # One batch == one prompt window. The seek target is the window grid by
+        # default, but a dynamic-sampling run advanced prompts one-for-one, so a
+        # resumed run seeks to the persisted prompt offset when present.
+        if start_prompt is None:
+            start_prompt = int(start_window) * batch_size
         super().__init__(
             batch_size=batch_size,
             seed=seed,
-            start_index=int(start_window) * batch_size,
+            start_index=int(start_prompt),
             wrap_epochs=True,
             **kwargs,
         )
@@ -201,6 +210,20 @@ RL_STEPS = int(os.environ.get("XRL_STEPS", "300"))
 from recipe.v100_windows import resolve_start_window
 
 WINDOW_PLAN = resolve_start_window(RL_STEPS)
+
+
+def _record_window_cursor(window_in_run: int, prompt_position: int) -> None:
+    """Persist the resume cursor after each emitted window.
+
+    The global window count is this run's start offset plus the 1-based window
+    just emitted; ``prompt_position`` is already the dataset's global offset and
+    is the authoritative no-replay seek target. Survives Adam resets / HF warm
+    starts because it is keyed by runtime root, not by run-tag DCP.
+    """
+    from recipe.v100_windows import write_rollout_cursor
+
+    global_window = int(WINDOW_PLAN.start_window) + int(window_in_run)
+    write_rollout_cursor(global_window, prompt_position)
 
 # fp32 master weights + fp16 FSDP compute + dynamic loss scaling (the sm70
 # default). XRL_TRAIN_DTYPE=float16 is uniform-fp16 storage: ~2 GiB cheaper
@@ -339,6 +362,9 @@ def _rollout_group() -> ServiceGroup:
         poll_interval=2.0,
         pacing_window=1,
         num_epochs=int(os.environ.get("XRL_EPOCHS", "1")),
+        # Persist the consumed-prompt cursor each window so a hot start / Adam
+        # reset seeks past every prompt already trained (no replay).
+        window_cursor="recipe.grpo_gsm8k_v100:_record_window_cursor",
         # In-loop holdout (200x1 at v0/50/.../250), milestone copy and
         # old-version pruning. Fires on the first group after each new
         # weight grant, so eval runs under the exact version with the

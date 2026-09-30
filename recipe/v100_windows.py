@@ -24,11 +24,94 @@ DCP wins when present; the env knob is then ignored (never stacked on top).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
 
 _DCP_STEP_RE = re.compile(r"step-(\d+)$")
+
+#: Authoritative resume cursor the rollout process advances once per emitted
+#: window. Unlike DCP (which an Adam-reset / HF warm start deliberately discards
+#: by using a fresh run tag) this lives under a fixed per-curriculum path in the
+#: runtime root and survives optimizer resets, so a continued run finds the next
+#: unseen prompt window even when no step-N checkpoint matches its run tag.
+ROLLOUT_CURSOR_FILE = "rollout_cursor.json"
+
+
+def _runtime_root() -> str:
+    return os.environ.get("XRL_RUNTIME_DIR", "").rstrip("/")
+
+
+def rollout_cursor_path() -> str | None:
+    """Filesystem path of the resume cursor, or None without a runtime root.
+
+    Namespaced by run tag (the same key DCP checkpoints use) so a brand-new run
+    under a fresh ``XRL_RUN_TAG`` never inherits a previous experiment's cursor,
+    while an Adam-reset continuation that keeps the same tag -- by design --
+    resumes where it left off.
+    """
+    root = _runtime_root()
+    if not root:
+        return None
+    return os.path.join(root, "rollout", run_tag(), ROLLOUT_CURSOR_FILE)
+
+
+def read_rollout_cursor() -> int:
+    """Number of prompt windows already consumed (0 if absent/unreadable)."""
+    path = rollout_cursor_path()
+    if not path or not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return max(0, int(data.get("consumed_windows", 0)))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def read_rollout_cursor_prompts() -> int:
+    """Number of prompts already consumed (authoritative no-replay offset).
+
+    Prefer this over ``consumed_windows * batch_size``: with DAPO dynamic
+    sampling a window draws replacement prompts, so prompt and window counts do
+    not stay proportional.
+    """
+    path = rollout_cursor_path()
+    if not path or not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return max(0, int(data.get("consumed_prompts", 0)))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def write_rollout_cursor(consumed_windows: int, consumed_prompts: int | None = None) -> None:
+    """Atomically persist the resume cursor (best-effort).
+
+    ``consumed_windows`` drives eval/version alignment; ``consumed_prompts`` (the
+    dataset's global prompt position) is the no-replay seek target.
+    """
+    path = rollout_cursor_path()
+    if not path:
+        return
+    consumed_windows = max(0, int(consumed_windows))
+    if consumed_prompts is None:
+        consumed_prompts = consumed_windows
+    payload = {
+        "consumed_windows": consumed_windows,
+        "consumed_prompts": max(0, int(consumed_prompts)),
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 
 
 def run_tag() -> str:
@@ -74,9 +157,17 @@ class WindowPlan:
     #: ``start_window`` (HF warm start numbers versions from 0).
     eval_offset: int
     resumed: bool
+    #: Global prompt offset to seek the dataset to. Equals
+    #: ``start_window * prompts_per_window`` except after dynamic sampling
+    #: (replacement draws advance the prompt cursor past the window*batch grid);
+    #: None when it is exactly ``start_window * batch_size`` (the common case).
+    start_prompt: int | None = None
 
 
 def resolve_start_window(rl_steps: int) -> WindowPlan:
+    # Explicit XRL_START_WINDOW always wins (operator knows the curriculum
+    # position, e.g. a deliberately replayed run).
+    explicit = os.environ.get("XRL_START_WINDOW")
     dcp_step = latest_dcp_step()
     if dcp_step is not None:
         return WindowPlan(
@@ -85,11 +176,31 @@ def resolve_start_window(rl_steps: int) -> WindowPlan:
             eval_offset=0,
             resumed=True,
         )
-    start = int(os.environ.get("XRL_START_WINDOW", "0"))
+    if explicit is not None:
+        start = int(explicit)
+        return WindowPlan(
+            start_window=start,
+            batches_this_run=rl_steps,
+            eval_offset=start,
+            resumed=False,
+        )
+    # No DCP and no explicit offset (the Adam-reset / HF warm-start case that
+    # used to replay from window 0): recover the data position from the
+    # rollout's persisted cursor so a continued run draws unseen prompts.
+    cursor = read_rollout_cursor()
+    cursor_prompts = read_rollout_cursor_prompts()
+    if cursor > 0:
+        return WindowPlan(
+            start_window=cursor,
+            batches_this_run=rl_steps,
+            eval_offset=cursor,
+            resumed=True,
+            start_prompt=cursor_prompts if cursor_prompts > 0 else None,
+        )
     return WindowPlan(
-        start_window=start,
+        start_window=0,
         batches_this_run=rl_steps,
-        eval_offset=start,
+        eval_offset=0,
         resumed=False,
     )
 

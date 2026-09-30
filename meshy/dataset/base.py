@@ -51,6 +51,11 @@ class Dataset:
         self._apply_epoch(epoch)
         self.index = within
 
+    @property
+    def global_position(self) -> int:
+        """Total prompts consumed across all epochs (epoch*len + index)."""
+        return self.epoch * len(self._base_dataset) + self.index
+
     def next_batch(self, builder: SampleBuilder) -> List[Sample]:
         n = len(self._base_dataset)
         # Gather a full batch even if it straddles an epoch boundary.

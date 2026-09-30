@@ -310,6 +310,14 @@ class RolloutServiceConfig(ServiceConfig):
     #: zero-variance so the trainer still receives a full window. None -> 3x
     #: target groups (the DAPO oversample ceiling).
     dynamic_max_prompts: int | None = None
+    #: Optional "module:fn" (or callable) invoked after each emitted window as
+    #: ``fn(window_in_run, global_prompt_position)`` so a recipe can persist a
+    #: resume cursor (hot-start / Adam-reset no-replay). The V100 recipe points
+    #: this at its rollout_cursor writer.
+    #: NOTE: whole-group partial rollout (XRL_PARTIAL_ROLLOUT) is deliberately
+    #: not on this branch; its dynamic/partial mutual-exclusion guard is
+    #: therefore also absent. T11 runs neither arm with partial.
+    window_cursor: str | Callable[[int, int], None] | None = None
     sampling_params: dict[str, Any] = field(default_factory=dict)
     group_size: int = 1
     num_epochs: int = 1

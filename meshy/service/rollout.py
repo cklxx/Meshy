@@ -50,6 +50,11 @@ def _build_rollout_worker(
     window_stats_log = kwargs.get("window_stats_log")
     if not window_stats_log and runtime_root:
         window_stats_log = RuntimeDir(runtime_root).rollout_window_stats_path()
+    window_cursor = kwargs.get("window_cursor")
+    if isinstance(window_cursor, str):
+        from meshy.worker.rollout import resolve_callable
+
+        window_cursor = resolve_callable(window_cursor)
     return RolloutWorker(
         engine=engine,
         endpoints_ref=kwargs["tq_endpoints_file"],
@@ -76,6 +81,7 @@ def _build_rollout_worker(
         poll_interval=float(kwargs.get("poll_interval", 2.0)),
         trajectory_log=trajectory_log,
         window_stats_log=window_stats_log,
+        window_cursor=window_cursor,
         verbose_trajectory_log=bool(kwargs.get("verbose_trajectory_log", False)),
         external_advantage=bool(kwargs.get("external_advantage", False)),
         version_hook=kwargs.get("version_hook"),

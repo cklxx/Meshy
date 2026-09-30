@@ -258,3 +258,115 @@ def test_bounded_gsm8k_seek_and_bound(monkeypatch):
         ref.extend(b)
     assert joined == ref
 
+
+
+# ---------- T7: persisted resume cursor (no-replay across hot starts) ------
+
+def _set_runtime(monkeypatch, tmp_path, tag):
+    monkeypatch.setenv("XRL_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("XRL_RUN_TAG", tag)
+    monkeypatch.setenv("XRL_CKPT_DIR", str(tmp_path / "ck"))
+    monkeypatch.delenv("XRL_START_WINDOW", raising=False)
+
+
+def test_cursor_roundtrip_and_path_namespacing(monkeypatch, tmp_path):
+    _set_runtime(monkeypatch, tmp_path, "runA")
+    path = v100_windows.rollout_cursor_path()
+    assert path.endswith(os.path.join("rollout", "runA", "rollout_cursor.json"))
+    assert v100_windows.read_rollout_cursor() == 0
+    v100_windows.write_rollout_cursor(5, consumed_prompts=40)
+    assert v100_windows.read_rollout_cursor() == 5
+    assert v100_windows.read_rollout_cursor_prompts() == 40
+    monkeypatch.setenv("XRL_RUN_TAG", "runB")  # fresh run sees no cursor
+    assert v100_windows.read_rollout_cursor() == 0
+
+
+def test_resolve_start_window_uses_persisted_cursor_without_env(monkeypatch, tmp_path):
+    _set_runtime(monkeypatch, tmp_path, "runA")
+    v100_windows.write_rollout_cursor(10, consumed_prompts=80)
+    plan = v100_windows.resolve_start_window(40)
+    assert plan.resumed is True
+    assert plan.start_window == 10
+    assert plan.start_prompt == 80
+    assert plan.eval_offset == 10
+
+
+def test_explicit_start_window_overrides_cursor(monkeypatch, tmp_path):
+    _set_runtime(monkeypatch, tmp_path, "runA")
+    v100_windows.write_rollout_cursor(10, consumed_prompts=80)
+    monkeypatch.setenv("XRL_START_WINDOW", "3")
+    plan = v100_windows.resolve_start_window(40)
+    assert plan.start_window == 3 and plan.start_prompt is None
+
+
+def test_two_segment_resume_draws_disjoint_prompts(monkeypatch, tmp_path):
+    """Reproduces the replay bug; asserts the persisted cursor fixes it."""
+    import recipe.grpo_gsm8k_v100 as recipe
+    import meshy.dataset.base as base
+    from meshy.dataset.gsm8k import GSM8K
+
+    _set_runtime(monkeypatch, tmp_path, "cleanRun")
+    monkeypatch.setattr(base.datasets, "load_dataset", lambda **kw: _FakeHF(_rows(7473)))
+    monkeypatch.setattr(
+        GSM8K, "apply_chat_template", lambda self, d, b: int(d["answer"][5:])
+    )
+    bs, W = 64, 5
+
+    def drain(start_window, batches, seek_prompt=None):
+        ds = recipe.BoundedGSM8K(
+            batch_size=bs, split="train", seed=42,
+            start_window=start_window, batches_this_run=batches,
+        )
+        if seek_prompt is not None:
+            ds.seek(seek_prompt)
+        out = []
+        while True:
+            b = ds.next_batch(None)
+            if not b:
+                break
+            out.extend(b)
+        return ds, out
+
+    ds_a, seg_a = drain(0, W)
+    v100_windows.write_rollout_cursor(W, consumed_prompts=ds_a.global_position)
+    assert ds_a.global_position == W * bs
+
+    plan_b = v100_windows.resolve_start_window(40)
+    # Segment B seeks to the cursor but, for this comparison, runs another W
+    # windows; its run-length budget (batches_this_run) is a separate concern.
+    _, seg_b = drain(plan_b.start_window, W, plan_b.start_prompt)
+
+    assert set(seg_a).isdisjoint(set(seg_b))
+    # One continuous BoundedGSM8K stream over 2W windows is the reference.
+    _, ref = drain(0, 2 * W)
+    assert seg_a + seg_b == ref
+
+
+def test_cross_epoch_reshuffle_stays_reproducible(monkeypatch, tmp_path):
+    """Past one epoch the order uses seed+epoch and a resume reproduces it."""
+    import recipe.grpo_gsm8k_v100 as recipe
+    import meshy.dataset.base as base
+    from meshy.dataset.gsm8k import GSM8K
+
+    _set_runtime(monkeypatch, tmp_path, "smallRun")
+    n, bs = 100, 64
+    monkeypatch.setattr(base.datasets, "load_dataset", lambda **kw: _FakeHF(_rows(n)))
+    monkeypatch.setattr(
+        GSM8K, "apply_chat_template", lambda self, d, b: int(d["answer"][5:])
+    )
+
+    def build_seek(seek_to):
+        ds = recipe.BoundedGSM8K(
+            batch_size=bs, split="train", seed=42, start_window=2, batches_this_run=2,
+        )
+        ds.seek(seek_to)
+        return ds
+
+    b1 = build_seek(140).next_batch(None)
+    assert build_seek(140).next_batch(None) == b1
+    assert len(b1) == 64  # wraps epoch1[40:100] + epoch2[0:4]
+    epoch1 = _FakeHF(_rows(n)).shuffle(43)
+    epoch2 = _FakeHF(_rows(n)).shuffle(44)
+    e1 = [int(epoch1.select(range(40, 100))[i]["answer"][5:]) for i in range(60)]
+    e2 = [int(epoch2.select(range(0, 4))[i]["answer"][5:]) for i in range(4)]
+    assert b1 == e1 + e2

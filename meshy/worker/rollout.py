@@ -328,6 +328,7 @@ class RolloutWorker(TQWorker):
         trajectory_log: str | None = None,
         verbose_trajectory_log: bool = False,
         window_stats_log: str | None = None,
+        window_cursor: Callable[[int, int], None] | None = None,
         external_advantage: bool = False,
         version_hook: str | Callable[..., Any] | None = None,
         version_hook_kwargs: dict[str, Any] | None = None,
@@ -431,6 +432,9 @@ class RolloutWorker(TQWorker):
         self.weight_version = 0
         self.samples_started = 0
         self.window_stats_log = window_stats_log
+        # Called after each emitted window as (global_window_index,
+        # global_prompt_position) so a recipe can persist a resume cursor.
+        self.window_cursor = window_cursor
         if self.window_stats_log:
             os.makedirs(os.path.dirname(os.path.abspath(self.window_stats_log)), exist_ok=True)
         self.trajectory_logger = (
@@ -805,6 +809,26 @@ class RolloutWorker(TQWorker):
                         len(kept) * self.group_size, window_dropped, filtered_ratio,
                     )
                 )
+                self._advance_window_cursor(dataset, self.dynamic_windows)
+
+    def _advance_window_cursor(self, dataset: Any, window_index: int) -> None:
+        """Persist this run's resume position after one emitted window.
+
+        ``window_index`` is the window count within this run; the dataset's
+        :attr:`global_position` is the authoritative prompt offset (it already
+        reflects any dynamic-sampling replacement draws and cross-epoch
+        reshuffles), so a resumed process seeks past every prompt consumed.
+        """
+        if self.window_cursor is None:
+            return
+        try:
+            prompt_pos = int(getattr(dataset, "global_position", 0))
+        except Exception:
+            prompt_pos = 0
+        try:
+            self.window_cursor(int(window_index), prompt_pos)
+        except Exception:
+            logger.exception("RolloutWorker: window cursor callback failed")
 
     async def _run_rollouts(self) -> None:
         from meshy.utils.sample import SampleBuilder
@@ -835,6 +859,7 @@ class RolloutWorker(TQWorker):
             dataset = self.dataset_factory(**self.dataset_kwargs)
             budget = self._oversample_budget(getattr(dataset, "n_prompts", None))
             filtered_at_epoch_start = self.groups_filtered
+            window_index = 0
             exhausted = False
             while not self.stopped:
                 prompts = dataset.next_batch(builder)
@@ -867,6 +892,11 @@ class RolloutWorker(TQWorker):
                     task = asyncio.create_task(execute(prompt, version))
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
+                # Persist the resume cursor at the window boundary. The prompt
+                # position is authoritative even while the groups are still in
+                # flight, so a crash at worst re-runs this single window.
+                window_index += 1
+                self._advance_window_cursor(dataset, window_index)
             if tasks:
                 # Let every in-flight group finish and land in TQ before we say
                 # the producer side is done, so the trainer cannot see a
