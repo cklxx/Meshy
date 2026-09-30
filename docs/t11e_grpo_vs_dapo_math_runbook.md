@@ -47,7 +47,7 @@ RL 算法族 GRPO→DAPO 的三件套（去 std 归一化、零方差组动态�
 | seq_len | `XRL_SEQ_LEN=5120` | 同 gsm8k |
 | 生成上限 | `MAX_NEW_TOKENS=4096`，temp=1.0 / top_p=1.0 / top_k=-1 | RL 采样口径，两臂一致 |
 | reward 任务分 | `meshy.dataset.hendrycks_math:HendrycksMATH.reward`（math_verify，0/1） | 同一判分 |
-| KV / graph | mem_fraction_static=0.60、triton attn、pytorch sampling、decode graph on（默认）、enable_memory_saver | 推理配置逐字一致 |
+| KV / graph | mem_fraction_static=0.60、**flash attn（`MESHY_SM70_FLASH_DECODE=1`，T3h sm70 warp-key flash-decoding）**、pytorch sampling、decode graph on（默认）、enable_memory_saver | 推理配置逐字一致 |
 | colocate 时序 | 同一 ColocationRing（infer FALLBACK / train ON_DEMAND）、pacing_window=1、poll_interval=2.0 | 同一 GPU 手序 |
 | 评测点 | 同一 hook、同一窗集合、同一题集、同一采样（见 §3） | 评测本身也要配对 |
 | checkpoint | DCP 间隔/保留数一致，dump 到**不同 run tag 子目录** | 隔离，不互相 resume |
@@ -348,6 +348,17 @@ OOM；一旦 smoke 崩溃，先停下来修稳定性（§3.1 风险项），不�
 1. 确认 `v100/math` 合入，**并把 env T11d（commit `8ec7b61`，window 统计与
    TB 指标）合进运行分支**；v100 上 math_verify 0.9.0 已装；
    `/data00/meshy/models/hendrycks_math_train` 与 `MATH-500` 快照在。
+   - **flash-decode（T3h，两臂都开 `MESHY_SM70_FLASH_DECODE=1`，已在
+     `v100_run_rl.sh`）**：首次 decode 会用 CUDA 12.4 nvcc JIT 编译
+     `meshy/kernels/csrc/flash_decode.cu`，约 1 分钟，第一窗启动慢属正常、
+     不是卡死（PATH 必须含 `/usr/local/cuda-12.4/bin`）。第一窗起服后，
+     在 scheduler 日志确认出现 `[sglang-sm70] flash-decode plan ...` 且
+     `scripts/sm70_flash_decode_e2e.py --only consistency` 式的
+     `sentinel_flash_called=true` 验收（kernel 真执行；只 exact_match=true
+     而 flash_called=false 是空通过，说明 guard/路径没生效，必须停）。
+   - colocate release/resume 已验证 flash 仅多 ~36MB 常驻、两轮 resume 200
+     无 OOM；若 resume 失败，看 `torch_memory_saver`/`csrc core.cpp` 行而非
+     仅看退出码。
 2. 写 `recipe/v100_math_common.py` + 两份薄 recipe（§1 diff 表），受控量
    写死两臂一致；窗数 N 与 ROLLOUT_BATCH 从 env 读但默认 `N=40`、
    `XRL_ROLLOUT_BATCH=64`（recipe 内默认值也设 64，不依赖 shell 记忆）。
@@ -415,6 +426,9 @@ window 0，clean40b 实测 2634 次 prompt 使用只覆盖 896 道题（12%）�
 export PATH=/usr/local/cuda-12.4/bin:$PATH HF_ENDPOINT=https://hf-mirror.com
 export XRL_MODEL=/data00/meshy/models/Qwen3-0.6B
 export XRL_ROLLOUT_BATCH=64 XRL_GROUP_SIZE=8   # 512 样本/窗；不靠默认
+# flash-decode 两臂都开（v100_run_rl.sh 已 export，命令行直起也显式带上）：
+export MESHY_SGLANG_SM70=1 MESHY_SM70_FLASH_DECODE=1
+export XRL_DCP_CKPT_INTERVAL=3
 ```
 
 第 5 步 gating smoke（只 DAPO 配方，2 窗，无评测）：

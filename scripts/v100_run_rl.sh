@@ -10,10 +10,16 @@ export PATH=/usr/local/cuda-12.4/bin:$PATH
 export HF_ENDPOINT=https://hf-mirror.com
 export MESHY_SGLANG_SM70=1
 export MESHY_SM70_TILELANG=1
+# sm70 hand-written flash-decoding attention (replaces triton decode;
+# +75%/MATH, +101%/GSM8K end-to-end at ctx ~1.2-1.4k, T3h).
+export MESHY_SM70_FLASH_DECODE=1
 # Decode CUDA graph is the sm70 default; graph off only on OOM/manual fallback.
 # Do NOT set MESHY_SM70_SAVER_MANAGES_GRAPH (unverified branch, main order).
 : "${MESHY_SM70_CUDA_GRAPH:=1}"
 export MESHY_SM70_CUDA_GRAPH
+# Checkpoint every 3 windows (T11f explicit, was inherited default).
+: "${XRL_DCP_CKPT_INTERVAL:=3}"
+export XRL_DCP_CKPT_INTERVAL
 
 # Cap glibc malloc arenas: many threads (DCP/gather/sglang) otherwise fragment
 # host RAM across dozens of arenas and don't return pages, contributing to the
