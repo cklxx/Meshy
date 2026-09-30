@@ -132,8 +132,13 @@ class TitanTrainer(_BackendTitanTrainer):
     """TitanTrainer with Meshy metrics and TensorBoard publication."""
 
     def __init__(self, *args: Any, tensorboard_log_dir: str | None = None,
-                 tensorboard_enabled: bool = True, **kwargs: Any) -> None:
+                 tensorboard_enabled: bool = True,
+                 rollout_window_stats_path: str | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # JSONL the rollout process appends per window (dynamic sampling /
+        # partial rollout counters). Read back by weight_version so those
+        # scalars land in the training log and TensorBoard.
+        self._rollout_window_stats_path = rollout_window_stats_path
         # Only rank zero writes an event stream.  In non-distributed unit tests
         # dist is uninitialized and the local process is treated as rank zero.
         rank = 0
@@ -147,6 +152,57 @@ class TitanTrainer(_BackendTitanTrainer):
             tensorboard_log_dir if rank == 0 else None,
             tensorboard_enabled,
         )
+
+    def _read_window_stats(self) -> list[dict]:
+        """Read the rollout per-window JSONL from the last consumed offset.
+
+        Appends from another process are picked up on the next metrics call; a
+        missing/short file is normal early in a run and yields [].
+        """
+        path = self._rollout_window_stats_path
+        if not path:
+            return []
+        import json
+        import os
+
+        records: list[dict] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+        except (OSError, ValueError):
+            return []
+        return records
+
+    def _attach_window_stats(self, m: dict[str, float], current_version: int | None) -> None:
+        records = self._read_window_stats()
+        if not records:
+            return
+        # Match the window that produced this training step; fall back to the
+        # newest line if the version tag is unavailable/unknown.
+        if current_version is not None:
+            match = next((r for r in reversed(records)
+                          if r.get("weight_version") == current_version), None)
+        else:
+            match = records[-1]
+        if match is None:
+            return
+        if match.get("kind") == "dynamic":
+            m.update({
+                "grpo_metrics/filtered_ratio": float(match.get("filtered_ratio", 0.0)),
+                "grpo_metrics/groups_dropped_zero_variance": float(
+                    match.get("groups_dropped_zero_variance", 0)),
+                "grpo_metrics/refill_count": float(match.get("refill_count", 0)),
+                "rollout/window_prompts_drawn": float(match.get("prompts_drawn", 0)),
+                "rollout/window_valid_groups": float(match.get("valid_groups", 0)),
+            })
+        if match.get("kind") == "partial":
+            m.update({
+                "rollout/partial_groups_deferred": float(match.get("groups_deferred", 0)),
+                "rollout/partial_groups_closed": float(match.get("groups_closed", 0)),
+            })
 
     def restore_to_gpu(self) -> None:
         # Decoder.freqs_cis is a non-persistent root buffer.  The legacy
@@ -306,6 +362,10 @@ class TitanTrainer(_BackendTitanTrainer):
             # Fraction of *samples* whose generation was paused for a training
             # step and resumed on the next weights (Miles semantics).
             m["rollout/weight_version/mixed_version_ratio"] = _mean(mixed)
+
+        # Per-window rollout counters (dynamic sampling filtered_ratio, refill
+        # counts; partial-rollout deferrals) published by the rollout process.
+        self._attach_window_stats(m, current_version)
 
         hist = {
             "rollout/response_lengths": response_lengths,

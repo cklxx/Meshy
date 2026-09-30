@@ -59,6 +59,9 @@ def build_titan_trainer(
         forge_config,
         timer_enabled=timer_enabled,
         tensorboard_log_dir=(runtime.tensorboard_path(name) if runtime else None),
+        rollout_window_stats_path=(
+            runtime.rollout_window_stats_path() if runtime else None
+        ),
         **(trainer_params or {}),
     )
 

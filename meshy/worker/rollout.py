@@ -173,6 +173,21 @@ class TrajectoryLogger:
             output.write(blob)
 
 
+def append_window_stats(path: str | None, record: dict[str, Any]) -> None:
+    """Append one per-window rollout statistic line (best-effort, low rate).
+
+    The trainer correlates the line by ``weight_version`` and surfaces the
+    scalars (filtered_ratio, refill/drop counts) in its log + TensorBoard.
+    """
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        logger.exception("RolloutWorker: failed to write window stats {}", path)
+
+
 class RolloutWorker(TQWorker):
     """Read gen gates, generate grouped trajectories, and append them to TQ."""
 
@@ -204,6 +219,7 @@ class RolloutWorker(TQWorker):
         poll_interval: float = 2.0,
         trajectory_log: str | None = None,
         verbose_trajectory_log: bool = False,
+        window_stats_log: str | None = None,
         external_advantage: bool = False,
         version_hook: str | Callable[..., Any] | None = None,
         version_hook_kwargs: dict[str, Any] | None = None,
@@ -219,6 +235,9 @@ class RolloutWorker(TQWorker):
             pacing_window = 1
         if pacing_window is not None and int(pacing_window) < 1:
             raise ValueError("pacing_window must be >= 1, 'auto', or None")
+        # NOTE: the partial_rollout feature is not in this integration tree, so
+        # env's partial_rollout+dynamic_sampling mutual-exclusion guard is
+        # intentionally omitted here. Re-add it if/when partial rollout lands.
         self.engine = engine
         self.colocation = colocation
         self._colocation_request = None
@@ -303,6 +322,9 @@ class RolloutWorker(TQWorker):
         self.gates_seen = 0
         self.weight_version = 0
         self.samples_started = 0
+        self.window_stats_log = window_stats_log
+        if self.window_stats_log:
+            os.makedirs(os.path.dirname(os.path.abspath(self.window_stats_log)), exist_ok=True)
         self.trajectory_logger = (
             TrajectoryLogger(trajectory_log, verbose=verbose_trajectory_log)
             if trajectory_log
@@ -655,6 +677,18 @@ class RolloutWorker(TQWorker):
                 self.dynamic_prompts_drawn_total += window_drawn
                 self.dynamic_groups_dropped_total += window_dropped
                 filtered_ratio = window_dropped / window_drawn if window_drawn else 0.0
+                window_version = max(v for v, _ in kept)
+                append_window_stats(self.window_stats_log, {
+                    "kind": "dynamic",
+                    "window": self.dynamic_windows,
+                    "weight_version": window_version,
+                    "prompts_drawn": window_drawn,
+                    "valid_groups": len(kept),
+                    "valid_samples": len(kept) * self.group_size,
+                    "groups_dropped_zero_variance": window_dropped,
+                    "refill_count": window_dropped,
+                    "filtered_ratio": round(filtered_ratio, 6),
+                })
                 logger.info(
                     "RolloutWorker dynamic window {}: {} valid groups / {} prompts "
                     "({} samples), dropped {} zero-variance groups, filtered_ratio={:.3f}"

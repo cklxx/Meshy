@@ -72,6 +72,7 @@ def _worker(
     w.dynamic_prompts_drawn_total = 0
     w.dynamic_groups_dropped_total = 0
     w.dataset_kwargs = {}
+    w.window_stats_log = None
     w.written: list[tuple[int, list]] = []
     return w
 

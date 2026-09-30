@@ -84,6 +84,15 @@ class RuntimeDir:
         """Return the JSONL trajectory log path for this run."""
         return os.path.join(self.trajectory_dir, "trajectories.jsonl")
 
+    def rollout_window_stats_path(self) -> str:
+        """JSONL of per-window rollout statistics (dynamic sampling etc.).
+
+        The rollout process appends one line per window; the trainer reads the
+        line matching the weight version it is about to train so those scalars
+        reach its training log and TensorBoard (no TQ column needed).
+        """
+        return os.path.join(self.root, "rollout_window_stats.jsonl")
+
     # ── readiness markers ────────────────────────────────────────────────
     def _ready_key(self, name: str) -> str:
         return f"ready|{self.root}|{name}"

@@ -47,6 +47,9 @@ def _build_rollout_worker(
     trajectory_log = kwargs.get("trajectory_log")
     if not trajectory_log and runtime_root:
         trajectory_log = RuntimeDir(runtime_root).trajectory_path()
+    window_stats_log = kwargs.get("window_stats_log")
+    if not window_stats_log and runtime_root:
+        window_stats_log = RuntimeDir(runtime_root).rollout_window_stats_path()
     return RolloutWorker(
         engine=engine,
         endpoints_ref=kwargs["tq_endpoints_file"],
@@ -72,6 +75,7 @@ def _build_rollout_worker(
         max_running_requests=int(kwargs.get("async_max_running_request", -1) or -1),
         poll_interval=float(kwargs.get("poll_interval", 2.0)),
         trajectory_log=trajectory_log,
+        window_stats_log=window_stats_log,
         verbose_trajectory_log=bool(kwargs.get("verbose_trajectory_log", False)),
         external_advantage=bool(kwargs.get("external_advantage", False)),
         version_hook=kwargs.get("version_hook"),
