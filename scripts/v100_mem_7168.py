@@ -56,6 +56,15 @@ def _synthetic_sample(vocab: int) -> Sample:
 
 
 def main() -> None:
+    # torchtitan ForgeEngine reads torchrun env directly (no elastic launch in
+    # this standalone probe); provide a single-rank world.
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29577")
+    os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
+
     host_before = _host_avail_gb()
     torch.cuda.reset_peak_memory_stats()
 
