@@ -23,7 +23,6 @@ import torch  # noqa: E402
 
 from meshy.config import TrainerConfig  # noqa: E402
 from meshy.engine.titan import build_titan_trainer  # noqa: E402
-from meshy.utils.sample import Sample  # noqa: E402
 
 MODEL = os.environ.get("XRL_MODEL", "/data00/meshy/models/Qwen3-0.6B")
 
@@ -36,23 +35,25 @@ def _host_avail_gb() -> float:
     return float("nan")
 
 
-def _synthetic_sample(vocab: int) -> Sample:
-    # Deterministic pseudo-token stream; mask the assistant tail (the trainer
-    # scores assistant tokens). 7168 tokens total, all assistant for a worst-case
-    # activation footprint.
-    ids = [(i * 2654435761) % vocab for i in range(SEQ)]
-    n = len(ids)
-    return Sample(
-        messages=[{"role": "assistant", "content": "x" * n}],
-        tokens=ids,
-        logprobs=[-1.0] * n,
-        ground_truth=0,
-        reward=1.0,
-        advantage=0.5,
-        truncated=False,
-        repetition=False,
-        mixed_version=False,
-    )
+def _synthetic_sample(vocab: int) -> dict:
+    # The trainer consumes TQ-deserialized row DICTS (not the Sample dataclass):
+    # build_micro_batch indexes td["tokens"]/["mask_assistant"]/["logprobs"].
+    # Deterministic pseudo-token stream; mask the whole assistant tail (worst-
+    # case activation), 7168 tokens.
+    ids = torch.tensor([(i * 2654435761) % vocab for i in range(SEQ)], dtype=torch.long)
+    n = ids.shape[0]
+    return {
+        "tokens": ids,
+        "mask_assistant": torch.ones(n, dtype=torch.long),
+        "logprobs": torch.full((n,), -1.0, dtype=torch.float32),
+        "advantage": 0.5,
+        "reward": 1.0,
+        "ground_truth": 0,
+        "weight_version": 0,
+        "truncated": False,
+        "repetition": False,
+        "mixed_version": False,
+    }
 
 
 def main() -> None:
